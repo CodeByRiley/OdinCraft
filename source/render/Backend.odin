@@ -4,6 +4,7 @@ import rl   "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
 
 import blk  "../blocks" // Block, UVRect, Face enum if you put it there (PX,NX,PY,NY,PZ,NZ)
+import "../chunk"
 
 //
 // ── State & camera ────────────────────────────────────────────────────────────
@@ -64,6 +65,10 @@ get_camera :: proc() -> rl.Camera3D {
     return state.cam
 }
 
+get_camera_view_matrix :: proc() -> rl.Matrix {
+	return rl.GetCameraMatrix(state.cam)
+}
+
 begin_world :: proc() {
     rl.BeginMode3D(state.cam)
     // use the atlas if present
@@ -75,14 +80,10 @@ begin_world :: proc() {
 }
 end_world :: proc() {
     rl.EndMode3D()
-    // unbind texture (raylib usually handles, but keep consistent)
+    // unbind texture
     rlgl.SetTexture(0)
 }
 
-//
-// ── Atlas load (terrain.png) ──────────────────────────────────────────────────
-// Use point filter for classic look; if you enable bilinear/mips, nudge your UV
-// insets in your UV generator to 0.25..0.5 px.
 load_atlas :: proc(path: cstring) -> bool {
     if state.has_atlas {
         rl.UnloadTexture(state.atlas)
@@ -177,4 +178,22 @@ draw_block_at :: proc(x, y, z: i32, uvs: [8]blk.UVRect, tint: rl.Color) {
 draw_block :: proc(x, y, z: i32, b: blk.Block) {
     // Commonly you'd pick a tint via AO/light, but WHITE is fine to start.
     draw_block_at(x, y, z, b.uvs, rl.WHITE)
+}
+
+// draw_chunk :: proc(c: ^chunk.Chunk) {
+//     chunk.chunk_draw(c)
+// }
+
+draw_chunk_debug_blocks :: proc(c: ^chunk.Chunk) {
+    for x in 0..<chunk.CHUNK_SIZE_X {
+        for z in 0..<chunk.CHUNK_SIZE_Z {
+            for y in 0..<chunk.CHUNK_SIZE_Y {
+                bt := c.blocks[x][z][y]
+                if bt == blk.BlockType.Air do continue
+
+                uvs := blk.gen_block_uvs(&c.world.atlas, bt)
+                draw_block_at(cast(i32)x, cast(i32)y, cast(i32)z, uvs, rl.WHITE)
+            }
+        }
+    }
 }
