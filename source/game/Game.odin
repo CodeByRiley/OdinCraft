@@ -16,7 +16,7 @@ import "../shared"
 // Array of threads
 threads: [dynamic]^thread.Thread
 
-// A list to hold chunks that are marked for deletion.
+// NEW: A list to hold chunks that are marked for deletion.
 // We will free them on the next frame to ensure no worker thread is still using them.
 purgatory: [dynamic]^chunk.Chunk 
 
@@ -56,12 +56,13 @@ WorkerArgs :: struct {
     finished_queue: ^FinishedChunkQueue,
 }
 
+// --- CORRECTED AND THREAD-SAFE WORKER PROCEDURE ---
 worker_proc :: proc(t: ^thread.Thread) {
     args := (^WorkerArgs)(t.user_args[0])
     for i := args.start; i < len(args.chunks_to_generate); i += args.stride {
         c := args.chunks_to_generate[i]
         
-        // check if the chunk is still alive.
+        // CRITICAL CHECK 1: Before doing ANY work, check if the chunk is still alive.
         if !sync.atomic_load(&c.alive) {
             continue // Skip this chunk; it was unloaded before we could start.
         }
@@ -77,7 +78,7 @@ worker_proc :: proc(t: ^thread.Thread) {
         // Build mesh geometry
         geometry := chunk.chunk_build_geometry(c)
 
-        // Final check before pushing the result to the main thread.
+        // CRITICAL CHECK 3: Final check before pushing the result to the main thread.
         if sync.atomic_load(&c.alive) {
             work := shared.FinishedWork{
                 chunk_ptr = rawptr(c),
@@ -91,7 +92,7 @@ worker_proc :: proc(t: ^thread.Thread) {
 run :: proc() {
 	rl.SetTraceLogLevel(rl.TraceLogLevel.ALL)
 	blocks.init_registry()
-	render.init(1280, 720, "CubeGame (Raylib)")
+	render.init(1600, 900, "CubeGame (Raylib)")
 	defer render.shutdown()
 	render.set_target_fps(0)
 
@@ -146,8 +147,9 @@ run :: proc() {
 			last_cam_chunk_x = cam_chunk_x
 			last_cam_chunk_z = cam_chunk_z
 
+            // --- CORRECTED UNLOAD/LOAD LOGIC WITH PURGATORY ---
 
-            // Process the Purgatory
+            // STEP 1: Process the Purgatory (SAFE SHUTDOWN)
             // Free the chunks that were marked for death on the PREVIOUS frame.
             for c in purgatory {
                 chunk.chunk_unload_gpu(c)
@@ -160,7 +162,7 @@ run :: proc() {
 			gen_radius_sq    := gen_radius * gen_radius
 			unload_radius_sq := unload_radius * unload_radius
 
-			// Mark distant chunks for death and move them to the purgatory
+			// STEP 2: Mark distant chunks for death and move them to the purgatory
 			chunks_to_remove: [dynamic][2]int
 			for pos, c in world.chunks {
 				dx := c.cx - cam_chunk_x
@@ -180,7 +182,7 @@ run :: proc() {
 			}
 			delete(chunks_to_remove)
 
-			// Load new chunks (this logic is correct)
+			// Load new chunks
 			chunks_to_generate: [dynamic]^chunk.Chunk
 			for z in -gen_radius..=gen_radius {
 				for x in -gen_radius..=gen_radius {
@@ -265,8 +267,12 @@ run :: proc() {
 		rl.DrawFPS(10, 10)
         total_chunks := len(world.chunks)
         debug_text_str := fmt.tprintf("Visible Chunks: %d / %d", visible_chunks, total_chunks)
+        render_str := fmt.tprintf("Render Distance: %d / %d",view_distance_in_chunks, MAX_VIEW_DISTANCE)
         debug_text_cstr := strings.clone_to_cstring(debug_text_str, context.temp_allocator)
+        render_cstr := strings.clone_to_cstring(render_str, context.temp_allocator)
+
         rl.DrawText(debug_text_cstr, 10, 40, 20, rl.LIME)
+        rl.DrawText(render_cstr, 10, 65, 20, rl.LIME)
         render.end_frame()
     }
 }

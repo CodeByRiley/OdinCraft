@@ -297,39 +297,39 @@ default_terrain_params :: proc() -> TerrainParams {
 }
 
 chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, params: TerrainParams) {
-    // FINAL SAFEGUARD: Initial check before any work is done.
+    // Safeguard: Initial check before any work is done.
     if !sync.atomic_load(&c.alive) {
         return
     }
 
-    heights: [CHUNK_SIZE_X][CHUNK_SIZE_Z]int
+    // OPTIMIZATION: Swapped dimensions to [Z][X] to match the loop order for better cache performance.
+    heights: [CHUNK_SIZE_Z][CHUNK_SIZE_X]int
 
-    // --- Pass 1: Stone and Water ---
+    // --- Pass 1: Heightmap, Stone, and Water ---
     for z in 0..<CHUNK_SIZE_Z {
         for x in 0..<CHUNK_SIZE_X {
-            // SAFE POINT 1: Check periodically during the most expensive part of Pass 1.
-            // We check once per column.
-            if !sync.atomic_load(&c.alive) {
-                return // Abort generation
-            }
+            // Safe Point: Check for cancellation once per column.
+            if !sync.atomic_load(&c.alive) { return }
 
-            gx := c.cx*CHUNK_SIZE_X + x; gz := c.cz*CHUNK_SIZE_Z + z
-            nx := cast(f32)(gx) / params.scale; nz := cast(f32)(gz) / params.scale
+            gx := c.cx*CHUNK_SIZE_X + x
+            gz := c.cz*CHUNK_SIZE_Z + z
+            nx := cast(f32)(gx) / params.scale
+            nz := cast(f32)(gz) / params.scale
+
             hnoise := helpers.fbm2(noise, nx, nz, params.octaves, params.lacunarity, params.gain)
             height := params.sea_level + cast(int)(params.amplitude * hnoise)
             if height < 1 { height = 1 }
             if height > CHUNK_SIZE_Y-2 { height = CHUNK_SIZE_Y-2 }
-            heights[x][z] = height
+            heights[z][x] = height
 
-            for y in 0..=height {
-                c.blocks[y][z][x] = params.block_stone
-            }
-            if params.use_water && params.sea_level > height {
-                for y in height+1..=params.sea_level {
-                    if y >= 0 && y < CHUNK_SIZE_Y {
-                        c.blocks[y][z][x] = params.block_water
-                    }
+            // OPTIMIZATION: Fill the column with stone and water in a single pass.
+            for y in 0..<CHUNK_SIZE_Y {
+                if y <= height {
+                    c.blocks[y][z][x] = params.block_stone
+                } else if params.use_water && y <= params.sea_level {
+                    c.blocks[y][z][x] = params.block_water
                 }
+                // No need for an 'else', as the array is already zero-initialized to Air.
             }
         }
     }
@@ -339,15 +339,13 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
         inv := 1.0 / params.cave_scale
         for z in 0..<CHUNK_SIZE_Z {
             for x in 0..<CHUNK_SIZE_X {
-                top := heights[x][z]
+                top := heights[z][x]
                 for y in 1..=top {
-                    // SAFE POINT 2: Check every 16 blocks down during cave carving.
-                    if (y & 15) == 0 && !sync.atomic_load(&c.alive) {
-                        return // Abort generation
-                    }
+                    // Safe Point: Check periodically during the deep cave carving loop.
+                    if (y & 15) == 0 && !sync.atomic_load(&c.alive) { return }
 
                     nx := cast(f32)(c.cx*CHUNK_SIZE_X + x) * inv
-                    ny := cast(f32)(y) * inv
+                    ny := cast(f32)(y)                         * inv
                     nz := cast(f32)(c.cz*CHUNK_SIZE_Z + z) * inv
                     n3 := helpers.fbm3(noise, nx, ny, nz, params.cave_octaves, params.cave_lacunarity, params.cave_gain)
                     if n3 > params.cave_threshold {
@@ -357,29 +355,31 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
             }
         }
     }
-
-    // --- Pass 3: Topsoil ---
+    
+    // --- OPTIMIZATION: Pass 3 (Topsoil) is now integrated here, eliminating the need for a full chunk scan ---
     for z in 0..<CHUNK_SIZE_Z {
         for x in 0..<CHUNK_SIZE_X {
-            // SAFE POINT 3: Check once per column before the final pass.
-            if !sync.atomic_load(&c.alive) {
-                return // Abort generation
-            }
-            
-            y := CHUNK_SIZE_Y - 1
-            for y >= 1 {
-                if c.blocks[y][z][x] != blocks.BlockType.Air do break
-                y -= 1
-            }
-            if y < 1 do continue
+            // Safe Point: Final check before placing topsoil.
+            if !sync.atomic_load(&c.alive) { return }
 
-            if c.blocks[y][z][x] == params.block_stone {
-                c.blocks[y][z][x] = params.block_grass
+            // Find the true surface height after caves have been carved.
+            // We start searching from the original heightmap value, which is much faster than starting from the sky.
+            surface_y := heights[z][x]
+            for surface_y > 0 && c.blocks[surface_y][z][x] == blocks.BlockType.Air {
+                surface_y -= 1
+            }
+
+            // Only place topsoil if the surface is stone.
+            if c.blocks[surface_y][z][x] == params.block_stone {
+                c.blocks[surface_y][z][x] = params.block_grass
+
+                // Place the dirt layer underneath.
                 for d in 1..=params.top_soil {
-                    yy := y - d
-                    if yy <= 0 do break
-                    if c.blocks[yy][z][x] == params.block_stone {
-                        c.blocks[yy][z][x] = params.block_dirt
+                    dirt_y := surface_y - d
+                    if dirt_y < 0 { break }
+                    // Only replace stone with dirt.
+                    if c.blocks[dirt_y][z][x] == params.block_stone {
+                        c.blocks[dirt_y][z][x] = params.block_dirt
                     }
                 }
             }
