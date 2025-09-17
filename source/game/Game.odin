@@ -1,5 +1,6 @@
 package game
 
+import math "core:math"
 import thread  "core:thread"
 import sync  "core:sync"
 import fmt  "core:fmt"
@@ -8,9 +9,9 @@ import rl      "vendor:raylib"
 import strings "core:strings"
 import render  "../render"
 import blocks  "../blocks"
-//import mem "core:mem"
 import "../helpers"
 import "../chunk"
+import "../shared"
 
 // 8 x 8 of 32 x 32 chunks
 WORLD_SIZE_X :: 8 // 8 chunks x
@@ -19,67 +20,62 @@ WORLD_SIZE_Z :: 8 // 8 chunkz z
 // Array of threads
 threads: [dynamic]^thread.Thread
 
+
 FinishedChunkQueue :: struct {
-	chunks: [dynamic]^chunk.Chunk,
-	mutex:  sync.Mutex,
+    work:  [dynamic]shared.FinishedWork,
+    mutex: sync.Mutex,
 }
 
 // queue_push is called by worker threads
-queue_push :: proc(q: ^FinishedChunkQueue, c: ^chunk.Chunk) {
-	sync.mutex_lock(&q.mutex)
-	defer sync.mutex_unlock(&q.mutex)
-	append(&q.chunks, c)
+queue_push :: proc(q: ^FinishedChunkQueue, work: shared.FinishedWork) {
+    sync.mutex_lock(&q.mutex)
+    defer sync.mutex_unlock(&q.mutex)
+    append(&q.work, work)
 }
 
 // queue_pop is called by the main thread
-queue_pop :: proc(q: ^FinishedChunkQueue) -> (c: ^chunk.Chunk, ok: bool) {
-	sync.mutex_lock(&q.mutex)
-	defer sync.mutex_unlock(&q.mutex)
+queue_pop :: proc(q: ^FinishedChunkQueue) -> (work: shared.FinishedWork, ok: bool) {
+    sync.mutex_lock(&q.mutex)
+    defer sync.mutex_unlock(&q.mutex)
 
-	if len(q.chunks) > 0 {
-		c = q.chunks[0]
-		ok = true
-		ordered_remove(&q.chunks, 0)
-		return
-	}
-	return nil, false
+    if len(q.work) > 0 {
+        work = q.work[0]
+        ok = true
+        ordered_remove(&q.work, 0)
+        return
+    }
+    return shared.FinishedWork{}, false
 }
 
 WorkerArgs :: struct {
-	chunks:         []^chunk.Chunk,
-	noise:          ^helpers.Perlin,
-	seed:           u32,
-	params:         chunk.TerrainParams,
-	finished_queue: ^FinishedChunkQueue,
-
-	next_idx:       i32,
-	next_mutex:     sync.Mutex,
+    chunks_to_generate: [dynamic]^chunk.Chunk,
+    start:   int,   // first index this worker should process
+    stride:  int,   // hop by this many (num_workers)
+    noise:          ^helpers.Perlin,
+    seed:           u32,
+    params:         chunk.TerrainParams,
+    finished_queue: ^FinishedChunkQueue,
 }
 
 worker_proc :: proc(t: ^thread.Thread) {
-	// Retrieve the pointer from the user_args array.
-	args := (^WorkerArgs)(t.user_args[0])
-	
-	num_chunks := len(args.chunks)
+    args := (^WorkerArgs)(t.user_args[0])
+    for i := args.start; i < len(args.chunks_to_generate); i += args.stride {
+        c := args.chunks_to_generate[i]
+        
+        // Generate block data
+        chunk.chunk_generate_perlin(c, args.noise, args.seed, args.params)
 
-	for {
-		idx: i32
-		sync.mutex_lock(&args.next_mutex)
-		idx = args.next_idx
-		args.next_idx += 1
-		sync.mutex_unlock(&args.next_mutex)
+        //Build mesh geometry
+        geometry := chunk.chunk_build_geometry(c)
 
-		if idx >= i32(num_chunks) {
-			break
-		}
-
-		c := args.chunks[idx]
-		chunk.chunk_generate_perlin(c, args.noise, args.seed, args.params)
-		queue_push(args.finished_queue, c)
-	}
+        // Push finished work to the queue
+        queue_push(args.finished_queue, shared.FinishedWork{c, geometry})
+    }
 }
 
 run :: proc() {
+	rl.SetTraceLogLevel(rl.TraceLogLevel.ALL)
+	blocks.init_registry()
 	render.init(1280, 720, "CubeGame (Raylib)")
 	defer render.shutdown()
 	render.set_target_fps(0)
@@ -87,68 +83,31 @@ run :: proc() {
     frustum: render.Frustum
 
     view_distance_in_chunks := 8
-    // Define min/max so it doesn't go crazy.
     MIN_VIEW_DISTANCE :: 2
-    MAX_VIEW_DISTANCE :: 128
+    MAX_VIEW_DISTANCE :: 32 
 
-    // Noise
-	noise : helpers.Perlin
+    noise : helpers.Perlin
 	helpers.perlin_init(&noise, 1337)
-
-	// World + atlas
 	world : chunk.World
 	chunk.world_init(&world, 0.0)
 	tex := rl.LoadTexture("assets/atlas.png")
 	rl.SetTextureFilter(tex, rl.TextureFilter.POINT)
 	chunk.world_set_atlas_texture(&world, tex)
 
-	// Terrain params
 	tp := chunk.default_terrain_params()
 	tp.use_water   = true
 	tp.block_water = blocks.BlockType.Water
 
-	chunks := make([]^chunk.Chunk, WORLD_SIZE_X*WORLD_SIZE_Z, allocator=context.allocator)
-	for cz in 0..<WORLD_SIZE_Z {
-		for cx in 0..<WORLD_SIZE_X {
-			idx := cz*WORLD_SIZE_X + cx
-			c := new(chunk.Chunk)
-			chunk.chunk_init(c, cx, cz)
-			chunk.world_add_chunk(&world, c)
-			chunks[idx] = c
-		}
-	}
-
-    // Initialize the queue for finished chunks
 	finished_queue: FinishedChunkQueue
 
 	world_seed : u32 = 1337
+
 	num_workers := si.cpu.logical_cores - 1 
 	if num_workers < 1 do num_workers = 1
 	
-    wa := WorkerArgs{
-		chunks         = chunks,
-		noise          = &noise,
-		seed           = world_seed,
-		params         = tp,
-		finished_queue = &finished_queue,
-	}
-	threads = make([dynamic]^thread.Thread)
-	defer delete(threads)
-
-	// Spawn workers
-	fmt.printf("Spawning %v worker threads for terrain generation...\n", num_workers)
-	for _ in 0..<num_workers {
-		t := thread.create(worker_proc)
-		
-		// Set the first element of the user_args array to our arguments pointer.
-		t.user_args[0] = &wa
-
-		thread.start(t)
-		append(&threads, t)
-	}
     cam: rl.Camera3D
-	cam.position   = rl.Vector3{50, 10, 0}
-	cam.target     = rl.Vector3{ 0, 0,  0}
+	cam.position   = rl.Vector3{0, 80, 0}
+	cam.target     = rl.Vector3{ 1, 80,  1}
 	cam.up         = rl.Vector3{ 0,  1,  0}
 	cam.fovy       = 70
 	cam.projection = rl.CameraProjection.PERSPECTIVE
@@ -156,17 +115,17 @@ run :: proc() {
 	render.cam_init_from_current()
 	render.cam_lock_cursor()
 
+	last_cam_chunk_x, last_cam_chunk_z := math.max(int), math.max(int)
+	
 	for !render.should_close() {
 		render.cam_update_free(rl.GetFrameTime())
 
-        // Check for '+' key press (Equals key or Keypad Add)
         if rl.IsKeyPressed(rl.KeyboardKey.EQUAL) || rl.IsKeyPressed(rl.KeyboardKey.KP_ADD) {
             view_distance_in_chunks += 1
             if view_distance_in_chunks > MAX_VIEW_DISTANCE {
                 view_distance_in_chunks = MAX_VIEW_DISTANCE
             }
         }
-        // Check for '-' key press
         if rl.IsKeyPressed(rl.KeyboardKey.MINUS) || rl.IsKeyPressed(rl.KeyboardKey.KP_SUBTRACT) {
             view_distance_in_chunks -= 1
             if view_distance_in_chunks < MIN_VIEW_DISTANCE {
@@ -175,28 +134,106 @@ run :: proc() {
         }
 
         current_cam := render.get_camera()
+		cam_chunk_x := cast(int) math.floor(current_cam.position.x / cast(f32)chunk.CHUNK_SIZE_X)
+		cam_chunk_z := cast(int) math.floor(current_cam.position.z / cast(f32)chunk.CHUNK_SIZE_Z)
 
-        // Calculate the maximum draw distance based on our setting.
-        // We use squared distance to avoid expensive square root calculations.
+		if cam_chunk_x != last_cam_chunk_x || cam_chunk_z != last_cam_chunk_z {
+			last_cam_chunk_x = cam_chunk_x
+			last_cam_chunk_z = cam_chunk_z
+
+			// Keep unload radius equal to current view distance,
+			// but only generate within a slightly smaller radius.
+			gen_radius := view_distance_in_chunks - 1
+			if gen_radius < MIN_VIEW_DISTANCE do gen_radius = MIN_VIEW_DISTANCE
+
+			unload_radius := view_distance_in_chunks
+
+			gen_radius_sq    := gen_radius * gen_radius
+			unload_radius_sq := unload_radius * unload_radius
+
+			// --- Unload distant chunks ---
+            chunks_to_remove: [dynamic][2]int
+            chunks_to_free:   [dynamic]^chunk.Chunk
+            for pos, c in world.chunks {
+                dx := c.cx - cam_chunk_x
+                dz := c.cz - cam_chunk_z
+                if dx*dx + dz*dz > unload_radius_sq {
+                    append(&chunks_to_remove, pos)
+                    append(&chunks_to_free, c)
+                }
+            }
+
+            for pos in chunks_to_remove {
+                delete_key(&world.chunks, pos)
+            }
+
+            for c in chunks_to_free {
+                chunk.chunk_unload_gpu(c)
+                free(c)
+            }
+
+            // Clean up the temporary lists.
+            delete(chunks_to_remove)
+            delete(chunks_to_free)
+
+			// --- Load new chunks ---
+			chunks_to_generate: [dynamic]^chunk.Chunk
+			for z in -gen_radius..=gen_radius {
+				for x in -gen_radius..=gen_radius {
+					if x*x + z*z > gen_radius_sq {
+						continue
+					}
+					cx := cam_chunk_x + x
+					cz := cam_chunk_z + z
+
+					if _, ok := world.chunks[[2]int{cx, cz}]; !ok {
+						c := new(chunk.Chunk)
+						chunk.chunk_init(c, cx, cz)
+						chunk.world_add_chunk(&world, c)
+						append(&chunks_to_generate, c)
+					}
+				}
+			}
+
+			if len(chunks_to_generate) > 0 {
+				workers_to_spawn := math.min(num_workers, len(chunks_to_generate))
+
+				fmt.printf("Spawning %v worker threads for %v new chunks...\n", workers_to_spawn, len(chunks_to_generate))
+
+				for w in 0..<workers_to_spawn {
+					wa := new(WorkerArgs)
+					wa.chunks_to_generate = chunks_to_generate
+					wa.start   = w
+					wa.stride  = workers_to_spawn
+					wa.noise          = &noise
+					wa.seed           = world_seed
+					wa.params         = tp
+					wa.finished_queue = &finished_queue
+
+					t := thread.create(worker_proc)
+					t.user_args[0] = wa
+					thread.start(t)
+					append(&threads, t)
+				}
+			}
+		}
+
         max_draw_distance := f32(view_distance_in_chunks) * f32(chunk.CHUNK_SIZE_X)
         max_dist_sq := max_draw_distance * max_draw_distance
 
-		// Check for chunks that have finished generating and build their meshes.
-		// We can do a few per frame to avoid causing a super massive lag spike.
-		MAX_MESHES_PER_FRAME :: 4
+		MAX_MESHES_PER_FRAME :: 8
 		for _ in 0..<MAX_MESHES_PER_FRAME {
-			if finished_chunk, ok := queue_pop(&finished_queue); ok {
-                if(finished_chunk.dirty) {
-                    chunk.chunk_update_mesh(finished_chunk)
-                }
+			if work, ok := queue_pop(&finished_queue); ok {
+				// When using the work, cast the rawptr back to a typed chunk pointer
+				finished_chunk := (^chunk.Chunk)(work.chunk_ptr)
+				chunk.chunk_upload_geometry(finished_chunk, work.geometry)
 			} else {
-				// The queue is empty, no more meshing to do this frame.
 				break
 			}
 		}
-        // Get camera matrices
+        
         view_matrix := render.get_camera_view_matrix()
-		proj_matrix := rl.GetCameraProjectionMatrix(&current_cam, 16.9)
+		proj_matrix := rl.GetCameraProjectionMatrix(&current_cam, 16.0/9.0)
 		view_proj_matrix := proj_matrix * view_matrix
 		render.frustum_update(&frustum, view_proj_matrix)
 
@@ -209,12 +246,10 @@ run :: proc() {
 			// Opaque Pass
 			for _, c in world.chunks {
 				aabb := chunk.get_chunk_aabb(c)
-                
                 chunk_center := aabb.min + ((aabb.max - aabb.min) * 0.5)
                 dist_sq := rl.Vector3DistanceSqrt(current_cam.position, chunk_center)
                 
                 if dist_sq <= max_dist_sq {
-                    // passed the distance check, do frustum check.
                     if render.frustum_check_aabb(&frustum, aabb) {
                         chunk.chunk_draw_opaque(c)
                         visible_chunks += 1
@@ -239,17 +274,11 @@ run :: proc() {
 
 		rl.DrawFPS(10, 10)
         
-        // Debug info to verify it's working
         total_chunks := len(world.chunks)
         debug_text_str := fmt.tprintf("Visible Chunks: %d / %d", visible_chunks, total_chunks)
         debug_text_cstr := strings.clone_to_cstring(debug_text_str, context.temp_allocator)
         rl.DrawText(debug_text_cstr, 10, 40, 20, rl.LIME)
 
         render.end_frame()
-    }
-
-    // Cleanup threads
-    for t in threads {
-        thread.join(t)
     }
 }

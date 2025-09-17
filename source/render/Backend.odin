@@ -22,20 +22,13 @@ state := struct {
 init :: proc(w: i32, h: i32, title: cstring) {
     if state.inited do return
 
-    // rl.SetConfigFlags(rl.ConfigFlags_WINDOW_RESIZABLE | rl.ConfigFlags_MSAA_4X_HINT)
+    rl.SetConfigFlags(rl.ConfigFlags{.MSAA_4X_HINT, .WINDOW_RESIZABLE})
     rl.InitWindow(w, h, title)
     state.width  = w
     state.height = h
     state.inited = true
 
     rl.SetTargetFPS(1000)
-
-    // sensible default camera
-    // state.cam.position = rl.Vector3{ 16, 20, 32 }
-    // state.cam.target   = rl.Vector3{ 0, 12, 0  }
-    // state.cam.up       = rl.Vector3{ 0, 1,  0  }
-    // state.cam.fovy     = 70
-    // state.cam.projection = rl.CameraProjection.PERSPECTIVE
 }
 
 shutdown :: proc() {
@@ -58,6 +51,7 @@ window_size    :: proc() -> (i32, i32) { return rl.GetScreenWidth(), rl.GetScree
 
 //
 // ── Camera helpers ────────────────────────────────────────────────────────────
+//
 set_camera :: proc(cam: rl.Camera3D) {
     state.cam = cam
 }
@@ -155,7 +149,6 @@ uv_quad_from_rect :: proc(r: blk.UVRect) -> [4]rl.Vector2 {
 draw_block_at :: proc(x, y, z: i32, uvs: [8]blk.UVRect, tint: rl.Color) {
     base := rl.Vector3{ cast(f32)x, cast(f32)y, cast(f32)z }
 
-    // We stream per block; for chunked drawing you’ll want to batch per face or per chunk.
     rlgl.Begin(rlgl.QUADS)
     rlgl.Color4ub(tint.r, tint.g, tint.b, tint.a)
 
@@ -175,14 +168,10 @@ draw_block_at :: proc(x, y, z: i32, uvs: [8]blk.UVRect, tint: rl.Color) {
 //
 // ── Convenience: draw using a 'Block' directly ────────────────────────────────
 //
-draw_block :: proc(x, y, z: i32, b: blk.Block) {
-    // Commonly you'd pick a tint via AO/light, but WHITE is fine to start.
+draw_block :: proc(x, y, z: i32, b: blk.BlockData) {
     draw_block_at(x, y, z, b.uvs, rl.WHITE)
 }
 
-// draw_chunk :: proc(c: ^chunk.Chunk) {
-//     chunk.chunk_draw(c)
-// }
 
 draw_chunk_debug_blocks :: proc(c: ^chunk.Chunk) {
     for x in 0..<chunk.CHUNK_SIZE_X {

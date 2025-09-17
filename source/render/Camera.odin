@@ -25,20 +25,20 @@ v3_scale :: proc(a: rl.Vector3, s: f32) -> rl.Vector3 { return a * s }
 v3_len   :: proc(a: rl.Vector3) -> f32 { return math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z) }
 
 
-/// cam_init_defaults resets the camera controller to its default settings.
+// cam_init_defaults resets the camera controller to its default settings.
 cam_init_defaults :: proc() {
 	controller.yaw         = 0
 	controller.pitch       = 0
-	controller.speed       = 8.0
+	controller.speed       = 12.0
 	controller.mouse_sens  = 0.2
-	controller.fast_mult   = 4.0
+	controller.fast_mult   = 12.0
 	controller.slow_mult   = 0.25
 	controller.cursor_locked = false
 }
 
-/// cam_init_from_current synchronizes the controller's yaw and pitch angles based on
-/// the camera's existing position and target vectors. This should be called once after
-/// the main camera is first set up to ensure the controller starts with the correct orientation.
+// cam_init_from_current synchronizes the controller's yaw and pitch angles based on
+// the camera's existing position and target vectors. This should be called once after
+// the main camera is first set up to ensure the controller starts with the correct orientation.
 cam_init_from_current :: proc() {
 	cam_init_defaults()
 
@@ -56,29 +56,29 @@ cam_init_from_current :: proc() {
 	if controller.pitch >  +89 { controller.pitch = +89 }
 }
 
-/// cam_lock_cursor hides and locks the cursor to the center of the screen for mouse look.
+// cam_lock_cursor hides and locks the cursor to the center of the screen for mouse look.
 cam_lock_cursor   :: proc() { rl.DisableCursor(); controller.cursor_locked = true  }
-/// cam_unlock_cursor shows and frees the cursor.
+// cam_unlock_cursor shows and frees the cursor.
 cam_unlock_cursor :: proc() { rl.EnableCursor();  controller.cursor_locked = false }
-/// cam_toggle_cursor switches between the locked and unlocked cursor states.
+// cam_toggle_cursor switches between the locked and unlocked cursor states.
 cam_toggle_cursor :: proc() {
 	if controller.cursor_locked { cam_unlock_cursor() } else { cam_lock_cursor() }
 }
-/// cam_cursor_locked returns true if the cursor is currently locked.
+// cam_cursor_locked returns true if the cursor is currently locked.
 cam_cursor_locked :: proc() -> bool { return controller.cursor_locked }
 
-/// cam_set_speed sets the base movement speed of the camera.
+// cam_set_speed sets the base movement speed of the camera.
 cam_set_speed        :: proc(base_speed: f32) { controller.speed = base_speed }
-/// cam_set_speed_scales sets the multipliers for fast and slow movement modes.
+// cam_set_speed_scales sets the multipliers for fast and slow movement modes.
 cam_set_speed_scales :: proc(fast_mult, slow_mult: f32) {
 	controller.fast_mult = fast_mult
 	controller.slow_mult = slow_mult
 }
-/// cam_set_sensitivity sets the mouse look sensitivity.
+// cam_set_sensitivity sets the mouse look sensitivity.
 cam_set_sensitivity  :: proc(sens: f32) { controller.mouse_sens = sens }
 
-/// cam_update_free should be called every frame to update the free-fly camera's
-/// state based on user input. `dt` is delta time (rl.GetFrameTime()).
+// cam_update_free should be called every frame to update the free-fly camera's
+// state based on user input. `dt` is delta time (rl.GetFrameTime()).
 cam_update_free :: proc(dt: f32) {
 	// Toggle cursor lock with the Right Mouse Button.
 	if rl.IsMouseButtonPressed(rl.MouseButton.RIGHT) {
