@@ -1,20 +1,20 @@
 #version 450 core
 
-// Input attributes with Raylib's default names
-in vec3 vertexPosition;
-in vec2 vertexTexCoord;
-in vec4 vertexColor;
-in vec3 vertexNormal;
+// Input attributes with explicit locations matching Raylib's defaults
+layout(location = 0) in vec3 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
+layout(location = 2) in vec3 vertexNormal;
+layout(location = 3) in vec4 vertexColor;
 
 // Uniforms provided by Raylib
 uniform mat4 mvp;
 uniform mat4 matModel;
 
-// Outputs to the fragment shader
-out vec3 fragPosition_world; // Renamed to be clear
-out vec3 fragNormal_world;
-out vec2 fragTexCoord;
-out vec4 fragColor;
+// Outputs to the fragment shader with explicit locations
+layout(location = 0) out vec3 fragPosition_world;
+layout(location = 1) out vec3 fragNormal_world;
+layout(location = 2) out vec2 fragTexCoord;
+layout(location = 3) out vec4 fragColor;
 
 void main()
 {

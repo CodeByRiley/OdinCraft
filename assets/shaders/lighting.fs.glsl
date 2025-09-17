@@ -1,17 +1,18 @@
-#version 330 core
+#version 450 core
 
-// Inputs from the vertex shader
-in vec3 fragPosition_world;
-in vec3 fragNormal_world;
-in vec2 fragTexCoord;
-in vec4 fragColor;
+// Inputs from the vertex shader with matching locations
+layout(location = 0) in vec3 fragPosition_world;
+layout(location = 1) in vec3 fragNormal_world;
+layout(location = 2) in vec2 fragTexCoord;
+layout(location = 3) in vec4 fragColor;
 
 // Uniforms from our Odin code
 uniform sampler2D texture0;
 uniform sampler3D opacityData;
-uniform vec3 sunDirection; // NEW: For dynamic lighting
+uniform vec3 sunDirection;
 
-out vec4 finalColor;
+// Output color with explicit location
+layout(location = 0) out vec4 finalColor;
 
 void main()
 {
@@ -19,7 +20,7 @@ void main()
     vec4 atlasColor = texture(texture0, fragTexCoord);
     vec4 tintColor = fragColor / 255.0;
 
-    // If the alpha is 0, discard the pixel (for leaves, etc.)
+    // Discard transparent fragments (for leaves, etc.)
     if (atlasColor.a < 0.5) {
         discard;
     }
