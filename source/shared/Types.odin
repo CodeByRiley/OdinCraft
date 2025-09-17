@@ -6,6 +6,8 @@ MeshGeometry :: struct {
 }
 
 FinishedWork :: struct {
-    chunk_ptr: rawptr,
-    geometry:  ^MeshGeometry,
+    chunk_ptr:    rawptr,
+    geometry:     ^MeshGeometry,
+    opacity_data: []u8,
+    light_data:   []u8,
 }

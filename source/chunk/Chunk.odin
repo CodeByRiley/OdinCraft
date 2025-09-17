@@ -1,21 +1,27 @@
 package chunk
 
-import "../blocks"
 import rl   "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
+import gl "vendor:OpenGL"
 import mem "core:mem"
 import sync "core:sync"
-import "../shared"
+import fmt "core:fmt"
 import "../helpers"
+import "../blocks"
+import "../shared"
 
 // ───────────────────────────── Config ─────────────────────────────
 CHUNK_SIZE_X :: 32
 CHUNK_SIZE_Z :: 32
 CHUNK_SIZE_Y :: 256
-Face :: blocks.Face
+MAX_LIGHT      :: u8(15)
+AO_TABLE := [4]f32{ 0.125, 0.20, 0.40, 0.60 }
+TOP_FACE_AO_BIAS :: f32(0.25) // blend 25% toward 1.0 on +Y faces
+MIN_LIGHT_BIAS :: f32(0.08)   // tiny ambient floor so nothing is pitch-black
 BLOCKFLAGS_NONE :: blocks.BlockFlags(0)
 
 // ───────────────────────────── Types ─────────────────────────────
+Face :: blocks.Face
 
 World :: struct {
     chunks:    map[[2]int] ^Chunk,
@@ -24,8 +30,13 @@ World :: struct {
 }
 
 Chunk :: struct {
-    // CORRECTED LAYOUT: Y is the major axis for cache efficiency.
     blocks: [CHUNK_SIZE_Y][CHUNK_SIZE_Z][CHUNK_SIZE_X] blocks.BlockType,
+
+    // light volumes (per-voxel)
+    sky_light:   [CHUNK_SIZE_Y][CHUNK_SIZE_Z][CHUNK_SIZE_X] u8,
+    block_light: [CHUNK_SIZE_Y][CHUNK_SIZE_Z][CHUNK_SIZE_X] u8,
+    lights_ready: bool,
+
     cx, cz: int,
     world:  ^World,
     mesh:  rl.Mesh,
@@ -36,6 +47,9 @@ Chunk :: struct {
     models_water:  [dynamic]rl.Model,
     dirty: bool,
     alive: bool,
+
+    opacity_tex_id: u32,
+    light_tex_id:   u32,
 }
 
 // ───────────────────────────── Utils ─────────────────────────────
@@ -100,6 +114,7 @@ chunk_init :: proc(c: ^Chunk, cx, cz: int) {
     c.cx = cx; c.cz = cz
     c.dirty = true
     c.alive = true // Set the chunk as alive upon creation.
+	c.lights_ready = false
     c.mesh  = rl.Mesh{}
     c.model = rl.Model{}
 
@@ -114,9 +129,9 @@ chunk_init :: proc(c: ^Chunk, cx, cz: int) {
 
 chunk_set :: proc(c: ^Chunk, x, y, z: int, bt: blocks.BlockType) {
     if !in_bounds(x,y,z) do return
-
     c.blocks[y][z][x] = bt
     c.dirty = true
+    c.lights_ready = false
 }
 
 chunk_get :: proc(c: ^Chunk, x, y, z: int) -> blocks.BlockType {
@@ -142,6 +157,47 @@ get_block_world :: proc(c: ^Chunk, lx, ly, lz: int) -> blocks.BlockType {
     return nbor.blocks[ly][gz][gx]
 }
 
+get_chunk_and_local :: proc(
+    c: ^Chunk, lx, ly, lz: int
+) -> (cc: ^Chunk, x: int, y: int, z: int) {
+    if ly < 0 || ly >= CHUNK_SIZE_Y {
+        return nil, 0, 0, 0
+    }
+
+    nx := c.cx
+    nz := c.cz
+    gx := lx
+    gz := lz
+
+    for gx < 0             { gx += CHUNK_SIZE_X; nx -= 1 }
+    for gx >= CHUNK_SIZE_X { gx -= CHUNK_SIZE_X; nx += 1 }
+    for gz < 0             { gz += CHUNK_SIZE_Z; nz -= 1 }
+    for gz >= CHUNK_SIZE_Z { gz -= CHUNK_SIZE_Z; nz += 1 }
+
+    nbor := world_get_chunk(c.world, nx, nz)
+    if nbor == nil {
+        return nil, 0, 0, 0
+    }
+
+    return nbor, gx, ly, gz
+}
+
+get_sky_light_world :: proc(c: ^Chunk, lx, ly, lz: int) -> u8 {
+    cc, x, y, z := get_chunk_and_local(c, lx, ly, lz)
+    if cc == nil || !cc.lights_ready { // neighbor missing OR not lit yet
+        return MAX_LIGHT              // treat as open sky
+    }
+    return cc.sky_light[y][z][x]
+}
+
+get_block_light_world :: proc(c: ^Chunk, lx, ly, lz: int) -> u8 {
+    cc, x, y, z := get_chunk_and_local(c, lx, ly, lz)
+    if cc == nil || !cc.lights_ready {
+        return 0
+    }
+    return cc.block_light[y][z][x]
+}
+
 // ... (Other helpers like is_solid, get_uv_for, unload_gpu, aabb are correct) ...
 is_solid :: proc(bt: blocks.BlockType) -> bool {
     // This should use your registry's is_solid now
@@ -157,6 +213,129 @@ get_uv_for :: proc(atlas: ^blocks.Atlas, bt: blocks.BlockType, face: Face) -> (u
 	return r.u0, r.v0, r.u1, r.v1
 }
 
+_create_voxel_texture_3d :: proc(width, height, depth: int, data: rawptr) -> u32 {
+    tex_id: u32 = 0;
+    helpers.GL_GenTextures(1, &tex_id);
+    helpers.GL_BindTexture(gl.TEXTURE_3D, tex_id);
+
+    helpers.GL_TexImage3D(
+        gl.TEXTURE_3D,       // target
+        0,                   // level
+        gl.R8,               // internalformat
+        i32(width),          // width
+        i32(height),         // height
+        i32(depth),          // depth
+        0,                   // border
+        gl.RED,              // format
+        gl.UNSIGNED_BYTE,    // type
+        data,                // pixels
+    );
+
+    // COMPLETE PARAMETERS: You must set min/mag filter and S/T/R wrap modes.
+    helpers.GL_TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    helpers.GL_TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    helpers.GL_TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    helpers.GL_TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    helpers.GL_TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+    helpers.GL_BindTexture(gl.TEXTURE_3D, 0);
+    return tex_id;
+}
+
+// _create_voxel_texture_3d :: proc(width, height, depth: int, data: rawptr) -> u32 {
+//     tex_id: u32 = 0;
+
+//     // 1. Generate a texture name (ID) from OpenGL
+//     gl.GenTextures(1, &tex_id);
+
+//     // 2. Bind the texture to the GL_TEXTURE_3D target
+//     gl.BindTexture(gl.TEXTURE_3D, tex_id);
+
+//     // 3. Upload the texture data
+//     // This is the core function that allocates GPU memory and copies your data.
+//     gl.TexImage3D(
+//         gl.TEXTURE_3D,       // target
+//         0,                   // level of detail (mipmap)
+//         gl.R8,               // internal format (one 8-bit channel)
+//         auto_cast width,     // width
+//         auto_cast height,    // height
+//         auto_cast depth,     // depth
+//         0,                   // border (must be 0)
+//         gl.RED,              // format of the source data
+//         gl.UNSIGNED_BYTE,    // data type of the source data (u8)
+//         data,                // pointer to the data
+//     );
+
+//     // 4. Set texture parameters. For voxels, we want NEAREST filtering.
+//     gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+//     gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+//     gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+//     gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+//     gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+//     // 5. Unbind the texture
+//     gl.BindTexture(gl.TEXTURE_3D, 0);
+
+//     return tex_id;
+// }
+
+// Creates the raw data. To be called by a WORKER THREAD.
+// It does the slow work of filling the arrays and returns them.
+chunk_create_raw_gpu_data :: proc(c: ^Chunk) -> (opacity_data, light_data: []u8) {
+    // 1. Create data buffers in system memory
+    opacity_data = make([]u8, CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z)
+    light_data   = make([]u8, CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z)
+
+    found_bright_spot := false
+    // 2. Fill the buffers with chunk data
+    i := 0
+    for y in 0..<CHUNK_SIZE_Y {
+        for z in 0..<CHUNK_SIZE_Z {
+            for x in 0..<CHUNK_SIZE_X {
+                bt := c.blocks[y][z][x]
+                if blocks.is_opaque(bt) {
+                    opacity_data[i] = 255
+                } else {
+                    opacity_data[i] = 0
+                }
+                
+                sky_l   := c.sky_light[y][z][x]
+                block_l := c.block_light[y][z][x]
+                
+                light_val := max(sky_l, block_l)
+
+                if !found_bright_spot && light_val > 10 {
+                    found_bright_spot = true
+                }
+                light_data[i] = light_val * 17 // Scale 0-15 to 0-255
+                i += 1
+            }
+        }
+    }
+    if found_bright_spot {
+        fmt.printf("Chunk (%d, %d): OK - Found bright spots.\n", c.cx, c.cz)
+    } else {
+        fmt.printf("Chunk (%d, %d): ERROR - All light values are zero!\n", c.cx, c.cz)
+    }
+    // 3. Return the finished data. The worker will send this to the main thread.
+    return
+}
+
+// Uploads the data. To be called by the MAIN THREAD.
+// It takes the data prepared by the worker and performs the fast GPU upload.
+chunk_upload_gpu_data :: proc(c: ^Chunk, opacity_data, light_data: []u8) {
+    // 1. Unload old 3D textures if they exist, using our NEW function.
+    chunk_unload_gpu_data(c)
+
+    // 2. Create the new textures.
+    c.opacity_tex_id = _create_voxel_texture_3d(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, raw_data(opacity_data))
+    c.light_tex_id   = _create_voxel_texture_3d(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, raw_data(light_data))
+
+    // 3. IMPORTANT: Free the memory for the slices.
+    delete(opacity_data)
+    delete(light_data)
+}
+
 chunk_unload_gpu :: proc(c: ^Chunk) {
     if c == nil do return
     for i in 0..<len(c.models_opaque) { if c.models_opaque[i].meshCount > 0 { rl.UnloadModel(c.models_opaque[i]) } }
@@ -169,6 +348,17 @@ chunk_unload_gpu :: proc(c: ^Chunk) {
     } else if c.water_mesh.vertexCount > 0 { rl.UnloadMesh(c.water_mesh); c.water_mesh = rl.Mesh{} }
 }
 
+chunk_unload_gpu_data :: proc(c: ^Chunk) {
+    if c.opacity_tex_id != 0 {
+        helpers.GL_DeleteTextures(1, &c.opacity_tex_id)
+        c.opacity_tex_id = 0
+    }
+    if c.light_tex_id != 0 {
+        helpers.GL_DeleteTextures(1, &c.light_tex_id)
+        c.light_tex_id = 0
+    }
+}
+
 get_chunk_aabb :: proc(c: ^Chunk) -> rl.BoundingBox {
 	wx := f32(c.cx) * f32(CHUNK_SIZE_X)
 	wz := f32(c.cz) * f32(CHUNK_SIZE_Z)
@@ -177,16 +367,181 @@ get_chunk_aabb :: proc(c: ^Chunk) -> rl.BoundingBox {
 	return rl.BoundingBox{min, max}
 }
 
-// ───────────────── Meshing (Worker Thread) ─────────────────
+// Given face f and its vertex corner "co", compute AO (0..1) and light (0..1)
+sample_ao_and_light_for_corner :: proc(
+    c: ^Chunk, bt: blocks.BlockType, x, y, z: int, f: int, co: rl.Vector3
+) -> (ao: f32, light: f32) {
+    // sign from corner coords
+    sx: int; sy: int; sz: int
+    if co.x > 0.5 { sx = 1 } else { sx = -1 }
+    if co.y > 0.5 { sy = 1 } else { sy = -1 }
+    if co.z > 0.5 { sz = 1 } else { sz = -1 }
 
-chunk_build_geometry :: proc(c: ^Chunk) -> ^shared.MeshGeometry {
-    geo := new(shared.MeshGeometry)
-    
-    // CORRECTED: Loop order is Y -> Z -> X to match memory layout for max speed.
+    // tangent offsets B, C depend on face; N is face-normal (outside the block)
+    offB := [3]int{0,0,0}
+    offC := [3]int{0,0,0}
+    offN := [3]int{ NEI[f][0], NEI[f][1], NEI[f][2] } // <- face normal (PX,NX,PY,NY,PZ,NZ)
+
+    switch f {
+    case 0, 1: // ±X -> tangents Y,Z
+        offB = [3]int{0, sy, 0}
+        offC = [3]int{0, 0, sz}
+    case 2, 3: // ±Y -> tangents X,Z
+        offB = [3]int{sx, 0, 0}
+        offC = [3]int{0, 0, sz}
+    case 4, 5: // ±Z -> tangents X,Y
+        offB = [3]int{sx, 0, 0}
+        offC = [3]int{0, sy, 0}
+    }
+
+    // ---------------- AO (classic 3-sample)
+	occ :: proc(bt: blocks.BlockType) -> bool { return blocks.is_opaque(bt) }
+	s1 := occ(get_block_world(c, x+offB[0],           y+offB[1],           z+offB[2]))
+	s2 := occ(get_block_world(c, x+offC[0],           y+offC[1],           z+offC[2]))
+	s3 := occ(get_block_world(c, x+offB[0]+offC[0],   y+offB[1]+offC[1],   z+offB[2]+offC[2]))
+
+    ao_state := 3 - (int(s1) + int(s2) + int(s3))
+    if s1 && s2 { ao_state = 0 }
+    ao = AO_TABLE[ao_state]
+    if bt == blocks.BlockType.Water { ao = 1.0 } // optional: no AO on water
+
+	if f == 2 { // +Y face
+		ao = ao + (1.0 - ao) * TOP_FACE_AO_BIAS
+	}
+
+    // ---------------- Light sampling (use face-outside cell + its two edges + corner)
+    // Positions: N, N+B, N+C, N+B+C
+    sx0 := get_sky_light_world(  c, x+offN[0],           y+offN[1],           z+offN[2]           )
+    sx1 := get_sky_light_world(  c, x+offN[0]+offB[0],   y+offN[1]+offB[1],   z+offN[2]+offB[2]   )
+    sx2 := get_sky_light_world(  c, x+offN[0]+offC[0],   y+offN[1]+offC[1],   z+offN[2]+offC[2]   )
+    sx3 := get_sky_light_world(  c, x+offN[0]+offB[0]+offC[0], y+offN[1]+offB[1]+offC[1], z+offN[2]+offB[2]+offC[2] )
+
+    bx0 := get_block_light_world( c, x+offN[0],           y+offN[1],           z+offN[2]           )
+    bx1 := get_block_light_world( c, x+offN[0]+offB[0],   y+offN[1]+offB[1],   z+offN[2]+offB[2]   )
+    bx2 := get_block_light_world( c, x+offN[0]+offC[0],   y+offN[1]+offC[1],   z+offN[2]+offC[2]   )
+    bx3 := get_block_light_world( c, x+offN[0]+offB[0]+offC[0], y+offN[1]+offB[1]+offC[1], z+offN[2]+offB[2]+offC[2] )
+
+    // Use max so missing neighbor chunks / solids don't crush sunlight
+    sky  := f32(max(max(sx0, sx1), max(sx2, sx3)))
+    bloc := f32(max(max(bx0, bx1), max(bx2, bx3)))
+    l    := sky
+    if bloc > l { l = bloc }
+
+    light = l / f32(MAX_LIGHT)
+
+	if light < MIN_LIGHT_BIAS { light = MIN_LIGHT_BIAS }
+    if light > 1.0 { light = 1.0 }
+
+	if bt == blocks.BlockType.Water && light < 0.35 {
+		light = 0.35
+	}
+
+    return
+}
+
+build_skylight :: proc(c: ^Chunk) {
+    for z in 0..<CHUNK_SIZE_Z {
+        for x in 0..<CHUNK_SIZE_X {
+            light := u8(15)
+            for y := CHUNK_SIZE_Y-1; y >= 0; y -= 1 {
+                bt := c.blocks[y][z][x]
+                if blocks.is_opaque(bt) {
+					light = 0
+					c.sky_light[y][z][x] = 0
+				} else {
+					c.sky_light[y][z][x] = light
+					// (optional) attenuate through air: if light > 0 do light -= 1
+				}
+                if y == 0 do break // Odin signed loop guard
+            }
+        }
+    }
+}
+
+// Simple BFS flood for block lights inside the chunk (local-only first pass)
+build_blocklight :: proc(c: ^Chunk) {
+    // Zero it first
     for y in 0..<CHUNK_SIZE_Y {
         for z in 0..<CHUNK_SIZE_Z {
             for x in 0..<CHUNK_SIZE_X {
-            
+                c.block_light[y][z][x] = 0
+            }
+        }
+    }
+
+    // Seed queue with emitters
+    LightNode :: struct { x, y, z: i32, lvl: u8 }
+    q: [dynamic]LightNode
+    defer delete(q)
+
+    for y in 0..<CHUNK_SIZE_Y {
+        for z in 0..<CHUNK_SIZE_Z {
+            for x in 0..<CHUNK_SIZE_X {
+                e := blocks.block_emission(c.blocks[y][z][x])
+                if e > 0 {
+                    c.block_light[y][z][x] = e
+                    append(&q, LightNode{ cast(i32)x, cast(i32)y, cast(i32)z, e })
+                }
+            }
+        }
+    }
+
+    // BFS
+    qi := 0
+    for qi < len(q) {
+        n := q[qi]; qi += 1
+        if n.lvl <= 1 do continue
+
+        for d in 0..<6 {
+            nx := n.x + cast(i32)NEI[d][0]
+            ny := n.y + cast(i32)NEI[d][1]
+            nz := n.z + cast(i32)NEI[d][2]
+
+            if nx < 0 || nx >= CHUNK_SIZE_X ||
+               ny < 0 || ny >= CHUNK_SIZE_Y ||
+               nz < 0 || nz >= CHUNK_SIZE_Z { continue }
+
+            nb := c.blocks[ny][nz][nx]
+            if !blocks.can_light_through(nb) do continue
+
+            nl := u8(n.lvl - 1)
+            if c.block_light[ny][nz][nx] < nl {
+                c.block_light[ny][nz][nx] = nl
+                append(&q, LightNode{ x=nx, y=ny, z=nz, lvl=nl })
+            }
+        }
+    }
+}
+
+// Convenience
+chunk_rebuild_lighting :: proc(c: ^Chunk) {
+    c.lights_ready = false
+    build_skylight(c)
+    build_blocklight(c)
+    c.lights_ready = true
+}
+
+chunk_rebuild_lighting_neighbors :: proc(c: ^Chunk) {
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            nb := world_get_chunk(c.world, c.cx+dx, c.cz+dz)
+            if nb != nil {
+                build_skylight(nb)
+                build_blocklight(nb)
+            }
+        }
+    }
+}
+
+// ───────────────── Meshing (Worker Thread) ─────────────────
+
+// In chunk/Chunk.odin
+chunk_build_geometry :: proc(c: ^Chunk) -> ^shared.MeshGeometry {
+    geo := new(shared.MeshGeometry)
+    
+    for y in 0..<CHUNK_SIZE_Y {
+        for z in 0..<CHUNK_SIZE_Z {
+            for x in 0..<CHUNK_SIZE_X {
                 bt := c.blocks[y][z][x]
                 if bt == blocks.BlockType.Air do continue
                 is_water := bt == blocks.BlockType.Water
@@ -209,12 +564,13 @@ chunk_build_geometry :: proc(c: ^Chunk) -> ^shared.MeshGeometry {
                     face := FACE_DATA[f]
                     base := cast(u16)(len(vertsP^) / 3)
                     u0, v0, u1, v1 := get_uv_for(&c.world.atlas, bt, cast(Face)f)
-                    
+
                     for k in 0..<4 {
                         co := face.corners[k]
-                        px := cast(f32)(c.cx*CHUNK_SIZE_X + x) + co.x
-                        py := cast(f32)(y)                         + co.y
-                        pz := cast(f32)(c.cz*CHUNK_SIZE_Z + z) + co.z
+                        px := f32(c.cx*CHUNK_SIZE_X + x) + co.x
+                        py := f32(y)                         + co.y
+                        pz := f32(c.cz*CHUNK_SIZE_Z + z) + co.z
+
                         append(vertsP, px, py, pz)
                         append(normsP, face.nrm.x, face.nrm.y, face.nrm.z)
 
@@ -226,10 +582,15 @@ chunk_build_geometry :: proc(c: ^Chunk) -> ^shared.MeshGeometry {
                         }
                         u := u0 + (u1 - u0)*s; v := v0 + (v1 - v0)*t
                         append(uvsP, u, v)
-
-                        col := face_tint(bt, cast(Face)f)
-                        append(colorsP, col.r, col.g, col.b, col.a)
                     }
+
+                    // Set the vertex color to the base tint.
+                    base_col := face_tint(bt, cast(Face)f)
+                    for _ in 0..<4 {
+                        append(colorsP, base_col.r, base_col.g, base_col.b, base_col.a)
+                    }
+
+                    // Standard triangle indices
                     append(idxP, base+0, base+1, base+2)
                     append(idxP, base+0, base+2, base+3)
                 }
@@ -278,6 +639,14 @@ chunk_upload_geometry :: proc(c: ^Chunk, geo: ^shared.MeshGeometry) {
     c.dirty = false
 }
 
+// If a geometry won't be uploaded (e.g. chunk died), free it here.
+free_geometry :: proc(geo: ^shared.MeshGeometry) {
+    if geo == nil do return
+    delete(geo.vertsO); delete(geo.normsO); delete(geo.uvsO); delete(geo.colorsO); delete(geo.idxO)
+    delete(geo.vertsW); delete(geo.normsW); delete(geo.uvsW); delete(geo.colorsW); delete(geo.idxW)
+    free(geo)
+}
+
 // ───────────────── World Generation ─────────────────
 // (TerrainParams struct and default_terrain_params are correct and unchanged)
 TerrainParams :: struct {
@@ -302,13 +671,11 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
         return
     }
 
-    // OPTIMIZATION: Swapped dimensions to [Z][X] to match the loop order for better cache performance.
     heights: [CHUNK_SIZE_Z][CHUNK_SIZE_X]int
 
-    // --- Pass 1: Heightmap, Stone, and Water ---
+    // --- Pass 1: Heightmap, Stone, and Water (No changes here) ---
     for z in 0..<CHUNK_SIZE_Z {
         for x in 0..<CHUNK_SIZE_X {
-            // Safe Point: Check for cancellation once per column.
             if !sync.atomic_load(&c.alive) { return }
 
             gx := c.cx*CHUNK_SIZE_X + x
@@ -322,30 +689,27 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
             if height > CHUNK_SIZE_Y-2 { height = CHUNK_SIZE_Y-2 }
             heights[z][x] = height
 
-            // OPTIMIZATION: Fill the column with stone and water in a single pass.
             for y in 0..<CHUNK_SIZE_Y {
                 if y <= height {
                     c.blocks[y][z][x] = params.block_stone
                 } else if params.use_water && y <= params.sea_level {
                     c.blocks[y][z][x] = params.block_water
                 }
-                // No need for an 'else', as the array is already zero-initialized to Air.
             }
         }
     }
 
-    // --- Pass 2: Caves ---
+    // --- Pass 2: Caves (No changes here) ---
     if params.caves {
         inv := 1.0 / params.cave_scale
         for z in 0..<CHUNK_SIZE_Z {
             for x in 0..<CHUNK_SIZE_X {
                 top := heights[z][x]
                 for y in 1..=top {
-                    // Safe Point: Check periodically during the deep cave carving loop.
                     if (y & 15) == 0 && !sync.atomic_load(&c.alive) { return }
 
                     nx := cast(f32)(c.cx*CHUNK_SIZE_X + x) * inv
-                    ny := cast(f32)(y)                         * inv
+                    ny := cast(f32)(y) * inv
                     nz := cast(f32)(c.cz*CHUNK_SIZE_Z + z) * inv
                     n3 := helpers.fbm3(noise, nx, ny, nz, params.cave_octaves, params.cave_lacunarity, params.cave_gain)
                     if n3 > params.cave_threshold {
@@ -356,14 +720,12 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
         }
     }
     
-    // --- OPTIMIZATION: Pass 3 (Topsoil) is now integrated here, eliminating the need for a full chunk scan ---
+    // --- Pass 3: Topsoil (Changes are here) ---
     for z in 0..<CHUNK_SIZE_Z {
         for x in 0..<CHUNK_SIZE_X {
-            // Safe Point: Final check before placing topsoil.
             if !sync.atomic_load(&c.alive) { return }
 
             // Find the true surface height after caves have been carved.
-            // We start searching from the original heightmap value, which is much faster than starting from the sky.
             surface_y := heights[z][x]
             for surface_y > 0 && c.blocks[surface_y][z][x] == blocks.BlockType.Air {
                 surface_y -= 1
@@ -371,9 +733,24 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
 
             // Only place topsoil if the surface is stone.
             if c.blocks[surface_y][z][x] == params.block_stone {
-                c.blocks[surface_y][z][x] = params.block_grass
+                
+                // NEW: Check if the block directly above the surface is water.
+                is_underwater := false
+                if surface_y + 1 < CHUNK_SIZE_Y { // A quick check to make sure we don't look out of bounds
+                    if c.blocks[surface_y + 1][z][x] == params.block_water {
+                        is_underwater = true
+                    }
+                }
 
-                // Place the dirt layer underneath.
+                // NEW: Place dirt if underwater, otherwise place grass.
+                if is_underwater {
+                    // Tip: You could also add a 'block_sand' to your params for this case.
+                    c.blocks[surface_y][z][x] = params.block_dirt 
+                } else {
+                    c.blocks[surface_y][z][x] = params.block_grass
+                }
+
+                // Place the dirt layer underneath (this logic remains the same).
                 for d in 1..=params.top_soil {
                     dirt_y := surface_y - d
                     if dirt_y < 0 { break }
@@ -392,14 +769,22 @@ chunk_generate_perlin :: proc(c: ^Chunk, noise: ^helpers.Perlin, seed: u32, para
 // ───────────────── Drawing ─────────────────
 // (chunk_draw_opaque and chunk_draw_water are correct and unchanged)
 chunk_draw_opaque :: proc(c: ^Chunk) {
-    for m in c.models_opaque { rl.DrawModel(m, {0,0,0}, 1.0, rl.WHITE) }
-    if c.model.meshCount > 0 { rl.DrawModel(c.model, {0,0,0}, 1.0, rl.WHITE) }
+    // The world position of this chunk's origin (0,0,0)
+    chunk_pos := rl.Vector3{f32(c.cx * CHUNK_SIZE_X), 0, f32(c.cz * CHUNK_SIZE_Z)};
+
+    // Draw the model at its correct world position
+    if c.model.meshCount > 0 { rl.DrawModel(c.model, chunk_pos, 1.0, rl.WHITE) }
+    // (You can add the loop for models_opaque here too if you use it)
 }
+
 chunk_draw_water :: proc(c: ^Chunk) {
-    rl.BeginBlendMode(rl.BlendMode.ALPHA)
-    rlgl.DisableDepthMask()
-    for m in c.models_water { rl.DrawModel(m, {0,0,0}, 1.0, rl.WHITE) }
-    if c.water_model.meshCount > 0 { rl.DrawModel(c.water_model, {0,0,0}, 1.0, rl.WHITE) }
-    rlgl.EnableDepthMask()
-    rl.EndBlendMode()
+    // The world position of this chunk's origin (0,0,0)
+    chunk_pos := rl.Vector3{f32(c.cx * CHUNK_SIZE_X), 0, f32(c.cz * CHUNK_SIZE_Z)};
+
+    rl.BeginBlendMode(rl.BlendMode.ALPHA);
+    rlgl.DisableDepthMask();
+    // Draw the model at its correct world position
+    if c.water_model.meshCount > 0 { rl.DrawModel(c.water_model, chunk_pos, 1.0, rl.WHITE) }
+    rlgl.EnableDepthMask();
+    rl.EndBlendMode();
 }

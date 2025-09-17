@@ -85,6 +85,19 @@ is_opaque :: proc(bt: BlockType) -> bool {
     return false
 }
 
+can_light_through :: proc(bt: BlockType) -> bool {
+    // Allow light through non-opaque (air, leaves, glass, water, etc.)
+    return !is_opaque(bt)
+}
+block_emission :: proc(bt: BlockType) -> u8 {
+    // Simple: lava bright; other .Produce_Light blocks can be 14 by default
+    if bt == BlockType.Lava do return 15
+    if data, ok := get_block_data(bt); ok && data != nil {
+        if (data.flags & .Produce_Light) != BLOCKFLAGS_NONE do return 14
+    }
+    return 0
+}
+
 Atlas :: struct {
     tex_w, tex_h, tile_w, tile_h, cols, rows, inset_px: u16,
 }

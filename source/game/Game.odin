@@ -6,94 +6,31 @@ import sync  "core:sync"
 import fmt  "core:fmt"
 import si      "core:sys/info"
 import rl      "vendor:raylib"
+import rlgl "vendor:raylib/rlgl"
 import strings "core:strings"
 import render  "../render"
 import blocks  "../blocks"
-import "../helpers"
+import helpers "../helpers"
+import threading "../threading"
+import _ "../shared"
 import "../chunk"
-import "../shared"
 
-// Array of threads
-threads: [dynamic]^thread.Thread
-
-// NEW: A list to hold chunks that are marked for deletion.
-// We will free them on the next frame to ensure no worker thread is still using them.
-purgatory: [dynamic]^chunk.Chunk 
-
-FinishedChunkQueue :: struct {
-    work:  [dynamic]shared.FinishedWork,
-    mutex: sync.Mutex,
-}
-
-// queue_push is called by worker threads
-queue_push :: proc(q: ^FinishedChunkQueue, work: shared.FinishedWork) {
-    sync.mutex_lock(&q.mutex)
-    defer sync.mutex_unlock(&q.mutex)
-    append(&q.work, work)
-}
-
-// queue_pop is called by the main thread
-queue_pop :: proc(q: ^FinishedChunkQueue) -> (work: shared.FinishedWork, ok: bool) {
-    sync.mutex_lock(&q.mutex)
-    defer sync.mutex_unlock(&q.mutex)
-
-    if len(q.work) > 0 {
-        work = q.work[0]
-        ok = true
-        ordered_remove(&q.work, 0)
-        return
-    }
-    return shared.FinishedWork{}, false
-}
-
-WorkerArgs :: struct {
-    chunks_to_generate: [dynamic]^chunk.Chunk,
-    start:   int,
-    stride:  int,
-    noise:          ^helpers.Perlin,
-    seed:           u32,
-    params:         chunk.TerrainParams,
-    finished_queue: ^FinishedChunkQueue,
-}
-
-// --- CORRECTED AND THREAD-SAFE WORKER PROCEDURE ---
-worker_proc :: proc(t: ^thread.Thread) {
-    args := (^WorkerArgs)(t.user_args[0])
-    for i := args.start; i < len(args.chunks_to_generate); i += args.stride {
-        c := args.chunks_to_generate[i]
-        
-        // CRITICAL CHECK 1: Before doing ANY work, check if the chunk is still alive.
-        if !sync.atomic_load(&c.alive) {
-            continue // Skip this chunk; it was unloaded before we could start.
-        }
-
-        // Generate block data. This function now has internal checks as well.
-        chunk.chunk_generate_perlin(c, args.noise, args.seed, args.params)
-
-        // CRITICAL CHECK 2: Check again after generation and before the expensive meshing process.
-        if !sync.atomic_load(&c.alive) {
-            continue
-        }
-
-        // Build mesh geometry
-        geometry := chunk.chunk_build_geometry(c)
-
-        // CRITICAL CHECK 3: Final check before pushing the result to the main thread.
-        if sync.atomic_load(&c.alive) {
-            work := shared.FinishedWork{
-                chunk_ptr = rawptr(c),
-                geometry  = geometry,
-            }
-            queue_push(args.finished_queue, work)
-        }
-    }
-}
+remesh_q: threading.RemeshJobQueue
+finished_queue: threading.FinishedChunkQueue
+remesh_running := true
 
 run :: proc() {
 	rl.SetTraceLogLevel(rl.TraceLogLevel.ALL)
 	blocks.init_registry()
 	render.init(1600, 900, "CubeGame (Raylib)")
 	defer render.shutdown()
+	defer { remesh_running = false }
+
+	helpers.init_gl_loader() 
+	if !helpers.gl_custom_init() {
+		panic("FATAL: Failed to load required OpenGL procedures!")
+	}
+	fmt.println("Custom OpenGL procedures loaded successfully.")
 	render.set_target_fps(0)
 
     frustum: render.Frustum
@@ -109,10 +46,24 @@ run :: proc() {
 	rl.SetTextureFilter(tex, rl.TextureFilter.POINT)
 	chunk.world_set_atlas_texture(&world, tex)
 
+    voxel_shader := rl.LoadShader("assets/shaders/VoxelAO.vert.glsl", "assets/shaders/VoxelAO.frag.glsl")
+    opacity_tex_loc  := rl.GetShaderLocation(voxel_shader, "opacityData")
+    light_tex_loc    := rl.GetShaderLocation(voxel_shader, "lightData")
+    chunk_offset_loc := rl.GetShaderLocation(voxel_shader, "chunkOffset")
+    debug_mode_loc   := rl.GetShaderLocation(voxel_shader, "debugMode")
+
 	tp := chunk.default_terrain_params()
 	tp.use_water   = true
 
-	finished_queue: FinishedChunkQueue
+	rargs := new(threading.RemeshWorkerArgs)
+	rargs.job_q  = &remesh_q
+	rargs.out_q  = &finished_queue
+	rargs.running = &remesh_running
+	rth := thread.create(threading.remesh_worker_proc)
+	rth.user_args[0] = rargs
+	thread.start(rth)
+	append(&threading.threads, rth)
+
 	world_seed : u32 = 1337
 	num_workers := si.cpu.logical_cores - 1 
 	if num_workers < 1 do num_workers = 1
@@ -129,15 +80,20 @@ run :: proc() {
 
 	last_cam_chunk_x, last_cam_chunk_z := math.max(int), math.max(int)
 	
+    debug_mode: i32 = 0
+    debug_mode_text: string
+
 	for !render.should_close() {
 		render.cam_update_free(rl.GetFrameTime())
 
-        if rl.IsKeyPressed(.EQUAL) || rl.IsKeyPressed(.KP_ADD) {
-            view_distance_in_chunks = min(view_distance_in_chunks + 1, MAX_VIEW_DISTANCE)
-        }
-        if rl.IsKeyPressed(.MINUS) || rl.IsKeyPressed(.KP_SUBTRACT) {
-            view_distance_in_chunks = max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE)
-        }
+        if rl.IsKeyPressed(.EQUAL) || rl.IsKeyPressed(.KP_ADD) { view_distance_in_chunks = min(view_distance_in_chunks + 1, MAX_VIEW_DISTANCE) }
+        if rl.IsKeyPressed(.MINUS) || rl.IsKeyPressed(.KP_SUBTRACT) { view_distance_in_chunks = max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE) }
+		if rl.IsKeyPressed(.V) { render.set_flag_runtime(rl.ConfigFlag.VSYNC_HINT, !render.is_flag_active(.VSYNC_HINT)) }
+        if rl.IsKeyPressed(.ZERO) { debug_mode = 0 }
+        if rl.IsKeyPressed(.ONE) { debug_mode = 1 }
+        if rl.IsKeyPressed(.TWO) { debug_mode = 2 }
+        if rl.IsKeyPressed(.THREE) { debug_mode = 3 }
+        if rl.IsKeyPressed(.FOUR) { debug_mode = 4 }
 
         current_cam := render.get_camera()
 		cam_chunk_x := cast(int) math.floor(current_cam.position.x / f32(chunk.CHUNK_SIZE_X))
@@ -147,49 +103,31 @@ run :: proc() {
 			last_cam_chunk_x = cam_chunk_x
 			last_cam_chunk_z = cam_chunk_z
 
-            // --- CORRECTED UNLOAD/LOAD LOGIC WITH PURGATORY ---
-
-            // STEP 1: Process the Purgatory (SAFE SHUTDOWN)
-            // Free the chunks that were marked for death on the PREVIOUS frame.
-            for c in purgatory {
-                chunk.chunk_unload_gpu(c)
-                free(c)
-            }
-            clear(&purgatory)
-
+            // CORRECTED: No more purgatory. Unloading is simpler and safer.
 			gen_radius := max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE)
 			unload_radius := view_distance_in_chunks
 			gen_radius_sq    := gen_radius * gen_radius
 			unload_radius_sq := unload_radius * unload_radius
 
-			// STEP 2: Mark distant chunks for death and move them to the purgatory
 			chunks_to_remove: [dynamic][2]int
 			for pos, c in world.chunks {
 				dx := c.cx - cam_chunk_x
 				dz := c.cz - cam_chunk_z
 				if dx*dx + dz*dz > unload_radius_sq {
-                    // Signal to workers that this chunk is dead.
                     sync.atomic_store(&c.alive, false)
 					append(&chunks_to_remove, pos)
-                    // Add it to purgatory to be freed next frame.
-					append(&purgatory, c)
 				}
 			}
 
-            // Remove dead chunks from the active world map.
-			for pos in chunks_to_remove {
-				delete_key(&world.chunks, pos)
-			}
+			for pos in chunks_to_remove { delete_key(&world.chunks, pos) }
 			delete(chunks_to_remove)
 
-			// Load new chunks
 			chunks_to_generate: [dynamic]^chunk.Chunk
 			for z in -gen_radius..=gen_radius {
 				for x in -gen_radius..=gen_radius {
 					if x*x + z*z > gen_radius_sq { continue }
 					cx := cam_chunk_x + x
 					cz := cam_chunk_z + z
-
 					if _, ok := world.chunks[[2]int{cx, cz}]; !ok {
 						c := new(chunk.Chunk)
 						chunk.chunk_init(c, cx, cz)
@@ -202,39 +140,45 @@ run :: proc() {
 			if len(chunks_to_generate) > 0 {
 				workers_to_spawn := min(num_workers, len(chunks_to_generate))
 				fmt.printf("Spawning %v worker threads for %v new chunks...\n", workers_to_spawn, len(chunks_to_generate))
-
 				for w in 0..<workers_to_spawn {
-					wa := new(WorkerArgs)
+					wa := new(threading.WorkerArgs)
 					wa.chunks_to_generate = chunks_to_generate
-					wa.start   = w
-					wa.stride  = workers_to_spawn
-					wa.noise   = &noise
-					wa.seed    = world_seed
-					wa.params  = tp
+					wa.start, wa.stride = w, workers_to_spawn
+					wa.noise, wa.seed, wa.params = &noise, world_seed, tp
 					wa.finished_queue = &finished_queue
-
-					t := thread.create(worker_proc)
+					t := thread.create(threading.worker_proc)
 					t.user_args[0] = wa
 					thread.start(t)
-					append(&threads, t)
+					append(&threading.threads, t)
 				}
 			}
 		}
 
-        max_draw_distance := f32(view_distance_in_chunks) * f32(chunk.CHUNK_SIZE_X)
-        max_dist_sq := max_draw_distance * max_draw_distance
-		MAX_MESHES_PER_FRAME :: 8
-		for _ in 0..<MAX_MESHES_PER_FRAME {
-			if work, ok := queue_pop(&finished_queue); ok {
-				finished_chunk := (^chunk.Chunk)(work.chunk_ptr)
-                // Add a final safety check: only upload if the chunk is still alive.
+        // CORRECTED: Final, safe finished work loop.
+        MAX_MESHES_PER_FRAME :: 8
+        for _ in 0..<MAX_MESHES_PER_FRAME {
+            if work, ok := threading.queue_pop(&finished_queue); ok {
+                finished_chunk := (^chunk.Chunk)(work.chunk_ptr)
                 if finished_chunk != nil && sync.atomic_load(&finished_chunk.alive) {
-				    chunk.chunk_upload_geometry(finished_chunk, work.geometry)
+                    chunk.chunk_upload_geometry(finished_chunk, work.geometry)
+                    chunk.chunk_upload_gpu_data(finished_chunk, work.opacity_data, work.light_data)
+                    dirs := [][2]int{{+1,0},{-1,0},{0,+1},{0,-1},{+1,+1},{+1,-1},{-1,+1},{-1,-1}}
+                    for d in dirs {
+                        nb := chunk.world_get_chunk(&world, finished_chunk.cx + d[0], finished_chunk.cz + d[1])
+                        if nb != nil && sync.atomic_load(&nb.alive) {
+                            threading.remesh_push_unique(&remesh_q, nb)
+                        }
+                    }
+                } else if finished_chunk != nil {
+                    chunk.chunk_unload_gpu(finished_chunk)
+                    chunk.chunk_unload_gpu_data(finished_chunk)
+                    chunk.free_geometry(work.geometry)
+                    delete(work.opacity_data)
+                    delete(work.light_data)
+                    free(finished_chunk)
                 }
-			} else {
-				break
-			}
-		}
+            } else { break }
+        }
         
         view_matrix := render.get_camera_view_matrix()
 		proj_matrix := rl.GetCameraProjectionMatrix(&current_cam, 16.0/9.0)
@@ -244,35 +188,58 @@ run :: proc() {
         visible_chunks := 0
         render.begin_frame()
         render.clear_color(18, 18, 22, 255)
+        
         render.begin_world()
-			for _, c in world.chunks {
-				aabb := chunk.get_chunk_aabb(c)
-                chunk_center := aabb.min + ((aabb.max - aabb.min) * 0.5)
-                dist_sq := rl.Vector3DistanceSqrt(current_cam.position, chunk_center)
-                if dist_sq <= max_dist_sq && render.frustum_check_aabb(&frustum, aabb) {
-                    chunk.chunk_draw_opaque(c)
-                    visible_chunks += 1
+            rl.BeginShaderMode(voxel_shader)
+                rl.SetShaderValue(voxel_shader, debug_mode_loc, &debug_mode, .INT)
+                for _, c in world.chunks {
+                    aabb := chunk.get_chunk_aabb(c)
+                    dist_sq := rl.Vector3DistanceSqrt(current_cam.position, aabb.min + (aabb.max - aabb.min)*0.5)
+                    if dist_sq <= f32(view_distance_in_chunks*view_distance_in_chunks*chunk.CHUNK_SIZE_X*chunk.CHUNK_SIZE_X) && render.frustum_check_aabb(&frustum, aabb) {
+                        if c.model.meshCount > 0 {
+                            c.model.materials[0].shader = voxel_shader
+                            chunk_origin := rl.Vector3{f32(c.cx * chunk.CHUNK_SIZE_X), 0, f32(c.cz * chunk.CHUNK_SIZE_Z)}
+                            rl.SetShaderValue(voxel_shader, chunk_offset_loc, &chunk_origin, .VEC3)
+                            i32_2, i32_3 : i32 = 2, 3
+                            rlgl.ActiveTextureSlot(2)
+                            rlgl.SetTexture(c.opacity_tex_id)
+                            rl.SetShaderValue(voxel_shader, opacity_tex_loc, &i32_2, .INT)
+                            rlgl.ActiveTextureSlot(3)
+                            rlgl.SetTexture(c.light_tex_id)
+                            rl.SetShaderValue(voxel_shader, light_tex_loc, &i32_3, .INT)
+                            rlgl.ActiveTextureSlot(0)
+                            chunk.chunk_draw_opaque(c)
+                            visible_chunks += 1
+                        }
+                    }
                 }
-			}
+            rl.EndShaderMode()
+
 			for _, c in world.chunks {
-				aabb := chunk.get_chunk_aabb(c)
-                chunk_center := aabb.min + ((aabb.max - aabb.min) * 0.5)
-                dist_sq := rl.Vector3DistanceSqrt(current_cam.position, chunk_center)
-                if dist_sq <= max_dist_sq && render.frustum_check_aabb(&frustum, aabb) {
-                    chunk.chunk_draw_water(c)
+                aabb := chunk.get_chunk_aabb(c)
+                dist_sq := rl.Vector3DistanceSqrt(current_cam.position, aabb.min + (aabb.max - aabb.min)*0.5)
+                if dist_sq <= f32(view_distance_in_chunks*view_distance_in_chunks*chunk.CHUNK_SIZE_X*chunk.CHUNK_SIZE_X) && render.frustum_check_aabb(&frustum, aabb) {
+					chunk.chunk_draw_water(c)
                 }
 			}
 		render.end_world()
 
-		rl.DrawFPS(10, 10)
-        total_chunks := len(world.chunks)
-        debug_text_str := fmt.tprintf("Visible Chunks: %d / %d", visible_chunks, total_chunks)
+        switch debug_mode {
+        case 0: debug_mode_text = "Mode: 0 (Final Composite)"
+        case 1: debug_mode_text = "Mode: 1 (Atlas Texture)"
+        case 2: debug_mode_text = "Mode: 2 (Vertex Tint)"
+        case 3: debug_mode_text = "Mode: 3 (Light Map)"
+        case 4: debug_mode_text = "Mode: 4 (Ambient Occlusion)"
+        }
+		
+        debug_text_str := fmt.tprintf("Visible Chunks: %d / %d", visible_chunks, len(world.chunks))
         render_str := fmt.tprintf("Render Distance: %d / %d",view_distance_in_chunks, MAX_VIEW_DISTANCE)
-        debug_text_cstr := strings.clone_to_cstring(debug_text_str, context.temp_allocator)
-        render_cstr := strings.clone_to_cstring(render_str, context.temp_allocator)
-
-        rl.DrawText(debug_text_cstr, 10, 40, 20, rl.LIME)
-        rl.DrawText(render_cstr, 10, 65, 20, rl.LIME)
+		vsync_str := fmt.tprintf("VSync: %v\n", render.is_flag_active(.VSYNC_HINT))
+        rl.DrawText(strings.clone_to_cstring(debug_mode_text, context.temp_allocator), 10, 115, 20, rl.YELLOW)
+        rl.DrawText(strings.clone_to_cstring(debug_text_str, context.temp_allocator), 10, 40, 20, rl.LIME)
+        rl.DrawText(strings.clone_to_cstring(render_str, context.temp_allocator), 10, 65, 20, rl.LIME)
+        rl.DrawText(strings.clone_to_cstring(vsync_str, context.temp_allocator), 10, 90, 20, rl.LIME)
+		rl.DrawFPS(10, 10)
         render.end_frame()
     }
 }

@@ -48,7 +48,58 @@ begin_frame    :: proc() { rl.BeginDrawing() }
 clear_color    :: proc(r, g, b, a: u8) { rl.ClearBackground(rl.Color{r, g, b, a}) }
 end_frame      :: proc() { rl.EndDrawing() }
 window_size    :: proc() -> (i32, i32) { return rl.GetScreenWidth(), rl.GetScreenHeight() }
+get_window_flags :: proc() -> rl.ConfigFlags {
+    active := rl.ConfigFlags{}
+    // Add/remove items based on the flags your project cares about / your binding exposes.
+    flags_to_check := rl.ConfigFlags{
+        .VSYNC_HINT,
+        .FULLSCREEN_MODE,
+        .WINDOW_RESIZABLE,
+        .WINDOW_UNDECORATED,
+        .WINDOW_HIDDEN,
+        .WINDOW_MINIMIZED,
+        .WINDOW_MAXIMIZED,
+        .WINDOW_UNFOCUSED,
+        .WINDOW_TOPMOST,
+        .WINDOW_ALWAYS_RUN,
+        .WINDOW_TRANSPARENT,       // if your binding has it
+        .WINDOW_HIGHDPI,           // if your binding has it
+        .MSAA_4X_HINT,
+        .INTERLACED_HINT,          // if your binding has it
+        .WINDOW_MOUSE_PASSTHROUGH, // if your binding has it
+    }
+    for f in flags_to_check {
+        if rl.IsWindowState(rl.ConfigFlags{f}) {
+            active |= rl.ConfigFlags{f}
+        }
+    }
+    return active
+}
+is_flag_active :: proc(flag: rl.ConfigFlag) -> bool {
+    return rl.IsWindowState(rl.ConfigFlags{flag})
+}
+set_flag_runtime :: proc(flag: rl.ConfigFlag, enabled: bool) {
+    f := rl.ConfigFlags{flag}
+    if enabled {
+        if !rl.IsWindowState(f) {
+            rl.SetWindowState(f)
+        }
+    } else {
+        if rl.IsWindowState(f) {
+            rl.ClearWindowState(f)
+        }
+    }
+}
 
+// Convenience toggle
+toggle_flag_runtime :: proc(flag: rl.ConfigFlag) {
+    f := rl.ConfigFlags{flag}
+    if rl.IsWindowState(f) {
+        rl.ClearWindowState(f)
+    } else {
+        rl.SetWindowState(f)
+    }
+}
 //
 // ── Camera helpers ────────────────────────────────────────────────────────────
 //
