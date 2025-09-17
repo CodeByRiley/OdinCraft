@@ -62,16 +62,25 @@ get_block_data :: proc(bt: BlockType) -> (data: ^BlockData, ok: bool) {
 
 // is_solid checks a block's flag.
 is_solid :: proc(bt: BlockType) -> bool {
+    // First, check if the key exists in the registry.
     if data, ok := get_block_data(bt); ok {
-        return (data.flags & .Solid) != BLOCKFLAGS_NONE
+        // Before using the pointer, we must also ensure it is not nil.
+        // This prevents a crash even if the registry somehow contains a nil entry
+        // or if a race condition leads to a temporary invalid state.
+        if data != nil {
+            return (data.flags & .Solid) != BLOCKFLAGS_NONE
+        }
     }
+    // If the key doesn't exist OR the pointer is nil, the block is not solid.
     return false
 }
-
 // is_opaque checks a block's flag.
 is_opaque :: proc(bt: BlockType) -> bool {
     if data, ok := get_block_data(bt); ok {
-        return (data.flags & .Opaque) != BLOCKFLAGS_NONE
+        // the same nil check.
+        if data != nil {
+            return (data.flags & .Opaque) != BLOCKFLAGS_NONE
+        }
     }
     return false
 }

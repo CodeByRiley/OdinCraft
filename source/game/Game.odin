@@ -13,13 +13,12 @@ import "../helpers"
 import "../chunk"
 import "../shared"
 
-// 8 x 8 of 32 x 32 chunks
-WORLD_SIZE_X :: 8 // 8 chunks x
-WORLD_SIZE_Z :: 8 // 8 chunkz z
-
 // Array of threads
 threads: [dynamic]^thread.Thread
 
+// A list to hold chunks that are marked for deletion.
+// We will free them on the next frame to ensure no worker thread is still using them.
+purgatory: [dynamic]^chunk.Chunk 
 
 FinishedChunkQueue :: struct {
     work:  [dynamic]shared.FinishedWork,
@@ -49,8 +48,8 @@ queue_pop :: proc(q: ^FinishedChunkQueue) -> (work: shared.FinishedWork, ok: boo
 
 WorkerArgs :: struct {
     chunks_to_generate: [dynamic]^chunk.Chunk,
-    start:   int,   // first index this worker should process
-    stride:  int,   // hop by this many (num_workers)
+    start:   int,
+    stride:  int,
     noise:          ^helpers.Perlin,
     seed:           u32,
     params:         chunk.TerrainParams,
@@ -62,14 +61,30 @@ worker_proc :: proc(t: ^thread.Thread) {
     for i := args.start; i < len(args.chunks_to_generate); i += args.stride {
         c := args.chunks_to_generate[i]
         
-        // Generate block data
+        // check if the chunk is still alive.
+        if !sync.atomic_load(&c.alive) {
+            continue // Skip this chunk; it was unloaded before we could start.
+        }
+
+        // Generate block data. This function now has internal checks as well.
         chunk.chunk_generate_perlin(c, args.noise, args.seed, args.params)
 
-        //Build mesh geometry
+        // CRITICAL CHECK 2: Check again after generation and before the expensive meshing process.
+        if !sync.atomic_load(&c.alive) {
+            continue
+        }
+
+        // Build mesh geometry
         geometry := chunk.chunk_build_geometry(c)
 
-        // Push finished work to the queue
-        queue_push(args.finished_queue, shared.FinishedWork{c, geometry})
+        // Final check before pushing the result to the main thread.
+        if sync.atomic_load(&c.alive) {
+            work := shared.FinishedWork{
+                chunk_ptr = rawptr(c),
+                geometry  = geometry,
+            }
+            queue_push(args.finished_queue, work)
+        }
     }
 }
 
@@ -81,7 +96,6 @@ run :: proc() {
 	render.set_target_fps(0)
 
     frustum: render.Frustum
-
     view_distance_in_chunks := 8
     MIN_VIEW_DISTANCE :: 2
     MAX_VIEW_DISTANCE :: 32 
@@ -96,21 +110,18 @@ run :: proc() {
 
 	tp := chunk.default_terrain_params()
 	tp.use_water   = true
-	tp.block_water = blocks.BlockType.Water
 
 	finished_queue: FinishedChunkQueue
-
 	world_seed : u32 = 1337
-
 	num_workers := si.cpu.logical_cores - 1 
 	if num_workers < 1 do num_workers = 1
 	
     cam: rl.Camera3D
-	cam.position   = rl.Vector3{0, 80, 0}
-	cam.target     = rl.Vector3{ 1, 80,  1}
-	cam.up         = rl.Vector3{ 0,  1,  0}
+	cam.position   = {0, 80, 0}
+	cam.target     = {1, 80,  1}
+	cam.up         = {0,  1,  0}
 	cam.fovy       = 70
-	cam.projection = rl.CameraProjection.PERSPECTIVE
+	cam.projection = .PERSPECTIVE
 	render.set_camera(cam)
 	render.cam_init_from_current()
 	render.cam_lock_cursor()
@@ -120,69 +131,60 @@ run :: proc() {
 	for !render.should_close() {
 		render.cam_update_free(rl.GetFrameTime())
 
-        if rl.IsKeyPressed(rl.KeyboardKey.EQUAL) || rl.IsKeyPressed(rl.KeyboardKey.KP_ADD) {
-            view_distance_in_chunks += 1
-            if view_distance_in_chunks > MAX_VIEW_DISTANCE {
-                view_distance_in_chunks = MAX_VIEW_DISTANCE
-            }
+        if rl.IsKeyPressed(.EQUAL) || rl.IsKeyPressed(.KP_ADD) {
+            view_distance_in_chunks = min(view_distance_in_chunks + 1, MAX_VIEW_DISTANCE)
         }
-        if rl.IsKeyPressed(rl.KeyboardKey.MINUS) || rl.IsKeyPressed(rl.KeyboardKey.KP_SUBTRACT) {
-            view_distance_in_chunks -= 1
-            if view_distance_in_chunks < MIN_VIEW_DISTANCE {
-                view_distance_in_chunks = MIN_VIEW_DISTANCE
-            }
+        if rl.IsKeyPressed(.MINUS) || rl.IsKeyPressed(.KP_SUBTRACT) {
+            view_distance_in_chunks = max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE)
         }
 
         current_cam := render.get_camera()
-		cam_chunk_x := cast(int) math.floor(current_cam.position.x / cast(f32)chunk.CHUNK_SIZE_X)
-		cam_chunk_z := cast(int) math.floor(current_cam.position.z / cast(f32)chunk.CHUNK_SIZE_Z)
+		cam_chunk_x := cast(int) math.floor(current_cam.position.x / f32(chunk.CHUNK_SIZE_X))
+		cam_chunk_z := cast(int) math.floor(current_cam.position.z / f32(chunk.CHUNK_SIZE_Z))
 
 		if cam_chunk_x != last_cam_chunk_x || cam_chunk_z != last_cam_chunk_z {
 			last_cam_chunk_x = cam_chunk_x
 			last_cam_chunk_z = cam_chunk_z
 
-			// Keep unload radius equal to current view distance,
-			// but only generate within a slightly smaller radius.
-			gen_radius := view_distance_in_chunks - 1
-			if gen_radius < MIN_VIEW_DISTANCE do gen_radius = MIN_VIEW_DISTANCE
 
-			unload_radius := view_distance_in_chunks
-
-			gen_radius_sq    := gen_radius * gen_radius
-			unload_radius_sq := unload_radius * unload_radius
-
-			// --- Unload distant chunks ---
-            chunks_to_remove: [dynamic][2]int
-            chunks_to_free:   [dynamic]^chunk.Chunk
-            for pos, c in world.chunks {
-                dx := c.cx - cam_chunk_x
-                dz := c.cz - cam_chunk_z
-                if dx*dx + dz*dz > unload_radius_sq {
-                    append(&chunks_to_remove, pos)
-                    append(&chunks_to_free, c)
-                }
-            }
-
-            for pos in chunks_to_remove {
-                delete_key(&world.chunks, pos)
-            }
-
-            for c in chunks_to_free {
+            // Process the Purgatory
+            // Free the chunks that were marked for death on the PREVIOUS frame.
+            for c in purgatory {
                 chunk.chunk_unload_gpu(c)
                 free(c)
             }
+            clear(&purgatory)
 
-            // Clean up the temporary lists.
-            delete(chunks_to_remove)
-            delete(chunks_to_free)
+			gen_radius := max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE)
+			unload_radius := view_distance_in_chunks
+			gen_radius_sq    := gen_radius * gen_radius
+			unload_radius_sq := unload_radius * unload_radius
 
-			// --- Load new chunks ---
+			// Mark distant chunks for death and move them to the purgatory
+			chunks_to_remove: [dynamic][2]int
+			for pos, c in world.chunks {
+				dx := c.cx - cam_chunk_x
+				dz := c.cz - cam_chunk_z
+				if dx*dx + dz*dz > unload_radius_sq {
+                    // Signal to workers that this chunk is dead.
+                    sync.atomic_store(&c.alive, false)
+					append(&chunks_to_remove, pos)
+                    // Add it to purgatory to be freed next frame.
+					append(&purgatory, c)
+				}
+			}
+
+            // Remove dead chunks from the active world map.
+			for pos in chunks_to_remove {
+				delete_key(&world.chunks, pos)
+			}
+			delete(chunks_to_remove)
+
+			// Load new chunks (this logic is correct)
 			chunks_to_generate: [dynamic]^chunk.Chunk
 			for z in -gen_radius..=gen_radius {
 				for x in -gen_radius..=gen_radius {
-					if x*x + z*z > gen_radius_sq {
-						continue
-					}
+					if x*x + z*z > gen_radius_sq { continue }
 					cx := cam_chunk_x + x
 					cz := cam_chunk_z + z
 
@@ -196,8 +198,7 @@ run :: proc() {
 			}
 
 			if len(chunks_to_generate) > 0 {
-				workers_to_spawn := math.min(num_workers, len(chunks_to_generate))
-
+				workers_to_spawn := min(num_workers, len(chunks_to_generate))
 				fmt.printf("Spawning %v worker threads for %v new chunks...\n", workers_to_spawn, len(chunks_to_generate))
 
 				for w in 0..<workers_to_spawn {
@@ -205,9 +206,9 @@ run :: proc() {
 					wa.chunks_to_generate = chunks_to_generate
 					wa.start   = w
 					wa.stride  = workers_to_spawn
-					wa.noise          = &noise
-					wa.seed           = world_seed
-					wa.params         = tp
+					wa.noise   = &noise
+					wa.seed    = world_seed
+					wa.params  = tp
 					wa.finished_queue = &finished_queue
 
 					t := thread.create(worker_proc)
@@ -220,13 +221,14 @@ run :: proc() {
 
         max_draw_distance := f32(view_distance_in_chunks) * f32(chunk.CHUNK_SIZE_X)
         max_dist_sq := max_draw_distance * max_draw_distance
-
 		MAX_MESHES_PER_FRAME :: 8
 		for _ in 0..<MAX_MESHES_PER_FRAME {
 			if work, ok := queue_pop(&finished_queue); ok {
-				// When using the work, cast the rawptr back to a typed chunk pointer
 				finished_chunk := (^chunk.Chunk)(work.chunk_ptr)
-				chunk.chunk_upload_geometry(finished_chunk, work.geometry)
+                // Add a final safety check: only upload if the chunk is still alive.
+                if finished_chunk != nil && sync.atomic_load(&finished_chunk.alive) {
+				    chunk.chunk_upload_geometry(finished_chunk, work.geometry)
+                }
 			} else {
 				break
 			}
@@ -238,47 +240,33 @@ run :: proc() {
 		render.frustum_update(&frustum, view_proj_matrix)
 
         visible_chunks := 0
-
         render.begin_frame()
         render.clear_color(18, 18, 22, 255)
-
         render.begin_world()
-			// Opaque Pass
 			for _, c in world.chunks {
 				aabb := chunk.get_chunk_aabb(c)
                 chunk_center := aabb.min + ((aabb.max - aabb.min) * 0.5)
                 dist_sq := rl.Vector3DistanceSqrt(current_cam.position, chunk_center)
-                
-                if dist_sq <= max_dist_sq {
-                    if render.frustum_check_aabb(&frustum, aabb) {
-                        chunk.chunk_draw_opaque(c)
-                        visible_chunks += 1
-                    }
+                if dist_sq <= max_dist_sq && render.frustum_check_aabb(&frustum, aabb) {
+                    chunk.chunk_draw_opaque(c)
+                    visible_chunks += 1
                 }
 			}
-
-			// Water Pass
 			for _, c in world.chunks {
 				aabb := chunk.get_chunk_aabb(c)
                 chunk_center := aabb.min + ((aabb.max - aabb.min) * 0.5)
                 dist_sq := rl.Vector3DistanceSqrt(current_cam.position, chunk_center)
-
-                if dist_sq <= max_dist_sq {
-                    if render.frustum_check_aabb(&frustum, aabb) {
-                        chunk.chunk_draw_water(c)
-                    }
+                if dist_sq <= max_dist_sq && render.frustum_check_aabb(&frustum, aabb) {
+                    chunk.chunk_draw_water(c)
                 }
 			}
-
 		render.end_world()
 
 		rl.DrawFPS(10, 10)
-        
         total_chunks := len(world.chunks)
         debug_text_str := fmt.tprintf("Visible Chunks: %d / %d", visible_chunks, total_chunks)
         debug_text_cstr := strings.clone_to_cstring(debug_text_str, context.temp_allocator)
         rl.DrawText(debug_text_cstr, 10, 40, 20, rl.LIME)
-
         render.end_frame()
     }
 }

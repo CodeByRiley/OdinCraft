@@ -29,7 +29,7 @@ v3_len   :: proc(a: rl.Vector3) -> f32 { return math.sqrt(a.x*a.x + a.y*a.y + a.
 cam_init_defaults :: proc() {
 	controller.yaw         = 0
 	controller.pitch       = 0
-	controller.speed       = 12.0
+	controller.speed       = 20.0
 	controller.mouse_sens  = 0.2
 	controller.fast_mult   = 12.0
 	controller.slow_mult   = 0.25
