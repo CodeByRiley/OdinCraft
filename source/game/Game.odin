@@ -103,7 +103,6 @@ run :: proc() {
 			last_cam_chunk_x = cam_chunk_x
 			last_cam_chunk_z = cam_chunk_z
 
-            // CORRECTED: No more purgatory. Unloading is simpler and safer.
 			gen_radius := max(view_distance_in_chunks - 1, MIN_VIEW_DISTANCE)
 			unload_radius := view_distance_in_chunks
 			gen_radius_sq    := gen_radius * gen_radius

@@ -567,9 +567,9 @@ chunk_build_geometry :: proc(c: ^Chunk) -> ^shared.MeshGeometry {
 
                     for k in 0..<4 {
                         co := face.corners[k]
-                        px := f32(c.cx*CHUNK_SIZE_X + x) + co.x
-                        py := f32(y)                         + co.y
-                        pz := f32(c.cz*CHUNK_SIZE_Z + z) + co.z
+                        px := f32(x) + co.x
+                        py := f32(y) + co.y
+                        pz := f32(z) + co.z
 
                         append(vertsP, px, py, pz)
                         append(normsP, face.nrm.x, face.nrm.y, face.nrm.z)
