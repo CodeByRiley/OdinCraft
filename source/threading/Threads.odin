@@ -95,7 +95,7 @@ worker_proc :: proc(t: ^thread.Thread) {
         geometry := chunk.chunk_build_geometry(c)
 
         // 4. Create the raw data for the 3D textures
-        opacity_raw, light_raw := chunk.chunk_create_raw_gpu_data(c)
+        opacity_raw := chunk.chunk_create_raw_gpu_data(c)
 
         // 5. Push everything to the main thread
         if sync.atomic_load(&c.alive) {
@@ -103,14 +103,12 @@ worker_proc :: proc(t: ^thread.Thread) {
                 chunk_ptr    = rawptr(c),
                 geometry     = geometry,
                 opacity_data = opacity_raw,
-                light_data   = light_raw,
             }
             queue_push(args.finished_queue, work)
         } else {
             // Cleanup if it died mid-process
             chunk.free_geometry(geometry)
             delete(opacity_raw)
-            delete(light_raw)
         }
     }
 }
@@ -128,20 +126,18 @@ remesh_worker_proc :: proc(t: ^thread.Thread) {
 
         chunk.chunk_rebuild_lighting(c)
         geo := chunk.chunk_build_geometry(c)
-        opacity_raw, light_raw := chunk.chunk_create_raw_gpu_data(c)
+        opacity_raw := chunk.chunk_create_raw_gpu_data(c)
         
         if sync.atomic_load(&c.alive) {
             work := shared.FinishedWork{
                 chunk_ptr    = rawptr(c),
                 geometry     = geo,
                 opacity_data = opacity_raw,
-                light_data   = light_raw,
             }
             queue_push(args.out_q, work)
         } else {
             chunk.free_geometry(geo)
             delete(opacity_raw)
-            delete(light_raw)
         }
     }
 }

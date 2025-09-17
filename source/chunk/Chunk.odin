@@ -49,7 +49,6 @@ Chunk :: struct {
     alive: bool,
 
     opacity_tex_id: u32,
-    light_tex_id:   u32,
 }
 
 // ───────────────────────────── Utils ─────────────────────────────
@@ -281,10 +280,9 @@ _create_voxel_texture_3d :: proc(width, height, depth: int, data: rawptr) -> u32
 
 // Creates the raw data. To be called by a WORKER THREAD.
 // It does the slow work of filling the arrays and returns them.
-chunk_create_raw_gpu_data :: proc(c: ^Chunk) -> (opacity_data, light_data: []u8) {
+chunk_create_raw_gpu_data :: proc(c: ^Chunk) -> (opacity_data: []u8) {
     // 1. Create data buffers in system memory
     opacity_data = make([]u8, CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z)
-    light_data   = make([]u8, CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z)
 
     found_bright_spot := false
     // 2. Fill the buffers with chunk data
@@ -298,16 +296,6 @@ chunk_create_raw_gpu_data :: proc(c: ^Chunk) -> (opacity_data, light_data: []u8)
                 } else {
                     opacity_data[i] = 0
                 }
-                
-                sky_l   := c.sky_light[y][z][x]
-                block_l := c.block_light[y][z][x]
-                
-                light_val := max(sky_l, block_l)
-
-                if !found_bright_spot && light_val > 10 {
-                    found_bright_spot = true
-                }
-                light_data[i] = light_val * 17 // Scale 0-15 to 0-255
                 i += 1
             }
         }
@@ -323,17 +311,15 @@ chunk_create_raw_gpu_data :: proc(c: ^Chunk) -> (opacity_data, light_data: []u8)
 
 // Uploads the data. To be called by the MAIN THREAD.
 // It takes the data prepared by the worker and performs the fast GPU upload.
-chunk_upload_gpu_data :: proc(c: ^Chunk, opacity_data, light_data: []u8) {
+chunk_upload_gpu_data :: proc(c: ^Chunk, opacity_data: []u8) {
     // 1. Unload old 3D textures if they exist, using our NEW function.
     chunk_unload_gpu_data(c)
 
     // 2. Create the new textures.
     c.opacity_tex_id = _create_voxel_texture_3d(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, raw_data(opacity_data))
-    c.light_tex_id   = _create_voxel_texture_3d(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, raw_data(light_data))
 
     // 3. IMPORTANT: Free the memory for the slices.
     delete(opacity_data)
-    delete(light_data)
 }
 
 chunk_unload_gpu :: proc(c: ^Chunk) {
@@ -352,10 +338,6 @@ chunk_unload_gpu_data :: proc(c: ^Chunk) {
     if c.opacity_tex_id != 0 {
         helpers.GL_DeleteTextures(1, &c.opacity_tex_id)
         c.opacity_tex_id = 0
-    }
-    if c.light_tex_id != 0 {
-        helpers.GL_DeleteTextures(1, &c.light_tex_id)
-        c.light_tex_id = 0
     }
 }
 

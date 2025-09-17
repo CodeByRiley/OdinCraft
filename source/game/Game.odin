@@ -46,11 +46,15 @@ run :: proc() {
 	rl.SetTextureFilter(tex, rl.TextureFilter.POINT)
 	chunk.world_set_atlas_texture(&world, tex)
 
-    voxel_shader := rl.LoadShader("assets/shaders/VoxelAO.vert.glsl", "assets/shaders/VoxelAO.frag.glsl")
-    opacity_tex_loc  := rl.GetShaderLocation(voxel_shader, "opacityData")
-    light_tex_loc    := rl.GetShaderLocation(voxel_shader, "lightData")
-    chunk_offset_loc := rl.GetShaderLocation(voxel_shader, "chunkOffset")
-    debug_mode_loc   := rl.GetShaderLocation(voxel_shader, "debugMode")
+    // MODIFIED: Load the new shader files
+    voxel_shader := rl.LoadShader("assets/shaders/lighting.vs.glsl", "assets/shaders/lighting.fs.glsl")
+    
+    // MODIFIED: Get locations for the new uniforms
+    opacity_tex_loc := rl.GetShaderLocation(voxel_shader, "opacityData")
+    sun_dir_loc     := rl.GetShaderLocation(voxel_shader, "sunDirection")
+    
+    // NEW: Define the sun's direction (points from above, slightly angled)
+    sun_direction := rl.Vector3Normalize({-0.6, -1.0, -0.3})
 
 	tp := chunk.default_terrain_params()
 	tp.use_water   = true
@@ -160,7 +164,7 @@ run :: proc() {
                 finished_chunk := (^chunk.Chunk)(work.chunk_ptr)
                 if finished_chunk != nil && sync.atomic_load(&finished_chunk.alive) {
                     chunk.chunk_upload_geometry(finished_chunk, work.geometry)
-                    chunk.chunk_upload_gpu_data(finished_chunk, work.opacity_data, work.light_data)
+                    chunk.chunk_upload_gpu_data(finished_chunk, work.opacity_data)
                     dirs := [][2]int{{+1,0},{-1,0},{0,+1},{0,-1},{+1,+1},{+1,-1},{-1,+1},{-1,-1}}
                     for d in dirs {
                         nb := chunk.world_get_chunk(&world, finished_chunk.cx + d[0], finished_chunk.cz + d[1])
@@ -173,7 +177,6 @@ run :: proc() {
                     chunk.chunk_unload_gpu_data(finished_chunk)
                     chunk.free_geometry(work.geometry)
                     delete(work.opacity_data)
-                    delete(work.light_data)
                     free(finished_chunk)
                 }
             } else { break }
@@ -190,26 +193,27 @@ run :: proc() {
         
         render.begin_world()
             rl.BeginShaderMode(voxel_shader)
-                rl.SetShaderValue(voxel_shader, debug_mode_loc, &debug_mode, .INT)
+                // Send the sun direction to the shader once per frame
+                rl.SetShaderValue(voxel_shader, sun_dir_loc, &sun_direction, .VEC3)
+
                 for _, c in world.chunks {
                     aabb := chunk.get_chunk_aabb(c)
                     dist_sq := rl.Vector3DistanceSqrt(current_cam.position, aabb.min + (aabb.max - aabb.min)*0.5)
                     if dist_sq <= f32(view_distance_in_chunks*view_distance_in_chunks*chunk.CHUNK_SIZE_X*chunk.CHUNK_SIZE_X) && render.frustum_check_aabb(&frustum, aabb) {
-                        if c.model.meshCount > 0 {
-                            c.model.materials[0].shader = voxel_shader
-                            chunk_origin := rl.Vector3{f32(c.cx * chunk.CHUNK_SIZE_X), 0, f32(c.cz * chunk.CHUNK_SIZE_Z)}
-                            rl.SetShaderValue(voxel_shader, chunk_offset_loc, &chunk_origin, .VEC3)
-                            i32_2, i32_3 : i32 = 2, 3
-                            rlgl.ActiveTextureSlot(2)
-                            rlgl.SetTexture(c.opacity_tex_id)
-                            rl.SetShaderValue(voxel_shader, opacity_tex_loc, &i32_2, .INT)
-                            rlgl.ActiveTextureSlot(3)
-                            rlgl.SetTexture(c.light_tex_id)
-                            rl.SetShaderValue(voxel_shader, light_tex_loc, &i32_3, .INT)
-                            rlgl.ActiveTextureSlot(0)
-                            chunk.chunk_draw_opaque(c)
-                            visible_chunks += 1
-                        }
+						if c.model.meshCount > 0 {
+							c.model.materials[0].shader = voxel_shader
+
+							// MODIFIED: We only need to bind one 3D texture now
+							i32_2 : i32 = 2
+							rlgl.ActiveTextureSlot(2)
+							rlgl.SetTexture(c.opacity_tex_id)
+							rl.SetShaderValue(voxel_shader, opacity_tex_loc, &i32_2, .INT)
+
+							rlgl.ActiveTextureSlot(0)
+
+							chunk.chunk_draw_opaque(c)
+							visible_chunks += 1
+						}
                     }
                 }
             rl.EndShaderMode()
